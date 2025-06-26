@@ -122,7 +122,19 @@ class CoordinateMapper:
             logger.error("Преобразование невозможно: матрица гомографии не рассчитана.")
             return None
 
-        pixel_coords_homogeneous = np.array([u, v, 1], dtype=np.float32)
+        # Шаг 1: Устраняем дисторсию для входной точки.
+        # Гомография корректно работает только на точках без искажений.
+        pixel_coords_distorted = np.array([[[u, v]]], dtype=np.float32)
+        
+        pixel_coords_undistorted = cv2.undistortPoints(
+            pixel_coords_distorted, self.mtx, self.dist, P=self.mtx
+        )
+        
+        # Извлекаем исправленные координаты
+        u_corr, v_corr = pixel_coords_undistorted[0, 0]
+
+        # Шаг 2: Применяем гомографию к ИСПРАВЛЕННОЙ точке.
+        pixel_coords_homogeneous = np.array([u_corr, v_corr, 1], dtype=np.float32)
         world_coords_2d_homogeneous = self.inv_homography_matrix @ pixel_coords_homogeneous
         
         # Нормализуем, чтобы последняя компонента была 1
@@ -135,7 +147,7 @@ class CoordinateMapper:
         
         world_coords_3d = np.array([world_x, world_y, self.work_plane_z])
         
-        logger.debug(f"Pixel ({u}, {v}) -> World ({world_coords_3d[0]:.4f}, {world_coords_3d[1]:.4f}, {world_coords_3d[2]:.4f})")
+        logger.debug(f"Pixel ({u}, {v}) -> Corrected ({u_corr:.2f}, {v_corr:.2f}) -> World ({world_coords_3d[0]:.4f}, {world_coords_3d[1]:.4f}, {world_coords_3d[2]:.4f})")
         return world_coords_3d
         
     def undistort_frame(self, frame: np.ndarray) -> np.ndarray:

@@ -27,6 +27,7 @@ class MotorController:
         
         self.api_endpoint = f"http://{self.ip_address}:{self.port}/api/command"
         self.ping_endpoint = f"http://{self.ip_address}:{self.port}/ping"
+        self.status_endpoint = f"http://{self.ip_address}:{self.port}/api/status"
 
         self.session = requests.Session()
         logger.info(f"MotorController инициализирован для работы с {self.api_endpoint}")
@@ -72,6 +73,40 @@ class MotorController:
         except requests.exceptions.RequestException:
             logger.error(f"Не удалось подключиться к ESP32 по адресу {self.ping_endpoint}.")
             return False
+
+    def is_moving(self) -> bool:
+        """
+        Проверяет, движется ли робот в данный момент, опрашивая эндпоинт статуса.
+
+        Returns:
+            bool: True, если хотя бы один мотор движется; False в противном случае.
+                  В случае ошибки связи возвращает True для безопасности.
+        """
+        try:
+            # Используем более короткий таймаут для частых опросов статуса
+            response = self.session.get(self.status_endpoint, timeout=self.timeout * 0.5)
+            response.raise_for_status()
+            status_data = response.json()
+            
+            motors_status = status_data.get("motors", [])
+            if not isinstance(motors_status, list):
+                logger.warning(f"Получен некорректный формат статуса моторов: {motors_status}")
+                return True # Безопаснее считать, что робот движется
+
+            for motor in motors_status:
+                if isinstance(motor, dict) and motor.get("moving", False):
+                    return True # Если хотя бы один мотор движется, возвращаем True
+            
+            return False # Ни один мотор не движется
+
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Не удалось получить статус с контроллера: {e}. "
+                           "Предполагаем, что движение продолжается (fail-safe).")
+            return True # Безопаснее считать, что робот движется, если нет связи
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Не удалось разобрать JSON ответа статуса: {e}. "
+                           "Предполагаем, что движение продолжается (fail-safe).")
+            return True # То же самое, если JSON некорректен
 
     def move_joints_by_steps(self, steps: list[int]) -> bool:
         """

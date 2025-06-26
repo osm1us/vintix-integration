@@ -6,8 +6,7 @@ import torch
 import numpy as np
 import logging
 from vintix.vintix import Vintix
-from config import load_config, settings
-from utils import get_logger
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +24,7 @@ class VintixAgent:
         Args:
             model_path (str): Path to the Vintix model checkpoint directory.
         """
-        self.logger = get_logger(__name__)
+        self.logger = logger
         self.logger.info("Initializing VintixAgent...")
 
         try:

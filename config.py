@@ -109,10 +109,6 @@ class VisionSettings:
 class AgentSettings:
     """Настройки для агента Vintix."""
     MODEL_PATH: str = "models/vintix_checkpoint"
-    # Длина контекста (истории), подаваемой в модель
-    CONTEXT_LENGTH: int = 10
-    # Имя задачи из metadata.json. ДОЛЖНО БЫТЬ ЗАМЕНЕНО НА РЕАЛЬНОЕ!
-    TASK_NAME: str = "xarm_pick_place_task_name_placeholder"
 
     class Episode:
         """Параметры одного эпизода (попытки)."""

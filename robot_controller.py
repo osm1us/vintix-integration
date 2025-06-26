@@ -53,6 +53,23 @@ class RobotController:
         """
         return self.current_angles_rad
 
+    def set_current_angles_rad(self, joint_angles_rad: list[float]):
+        """
+        Принудительно устанавливает внутреннее состояние углов робота.
+        Вызывать только после подтверждения завершения движения!
+        """
+        if len(joint_angles_rad) != self.num_joints:
+            logger.error(f"Попытка установить неверное количество углов. "
+                         f"Ожидалось {self.num_joints}, получено {len(joint_angles_rad)}.")
+            return
+        self.current_angles_rad = joint_angles_rad
+
+    def is_moving(self) -> bool:
+        """
+        Проверяет, движется ли робот в данный момент.
+        """
+        return self.motor_controller.is_moving()
+
     def get_end_effector_position(self) -> np.ndarray | None:
         """
         Возвращает текущее положение конечного эффектора (XYZ) на основе последних заданных углов.
@@ -90,7 +107,8 @@ class RobotController:
             success = self.motor_controller.move_joints_by_steps(steps)
             if success:
                 logger.info("Команда на движение успешно отправлена.")
-                self.current_angles_rad = joint_angles_rad
+                # ВНИМАНИЕ: Состояние self.current_angles_rad здесь больше не обновляется.
+                # Это должен делать вызывающий код после подтверждения завершения движения.
             else:
                 logger.error("Не удалось отправить команду на движение.")
             return success

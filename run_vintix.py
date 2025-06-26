@@ -17,13 +17,16 @@ from voice_control import VoiceControl, Command
 from utils import setup_logging, GracefulShutdown
 from datalogger import HDF5Logger
 
+setup_logging(name="VintixRunner", level=settings.system.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 
 class RobotState(Enum):
     """Состояния конечного автомата для управления роботом."""
-    IDLE = auto()          # Ожидание команд
-    PICK_PLACE = auto()    # Выполнение задачи "взять и положить"
+    IDLE = auto()               # Ожидание команд
+    PICK_PLACE_PLANNING = auto() # Поиск цели и планирование следующего шага
+    PICK_PLACE_MOVING = auto()   # Ожидание завершения движения робота
+    PICK_PLACE_GRASPING = auto() # Выполнение последовательности захвата
 
 
 class VintixRunner:
@@ -90,8 +93,12 @@ class VintixRunner:
                     self._handle_voice_command(voice_command)
 
                 # --- Шаг 3: Выполнение действий в зависимости от состояния ---
-                if self.state == RobotState.PICK_PLACE:
-                    frame = self._run_pick_place_step(frame)
+                if self.state == RobotState.PICK_PLACE_PLANNING:
+                    frame = self._handle_pick_place_planning(frame)
+                elif self.state == RobotState.PICK_PLACE_MOVING:
+                    frame = self._handle_pick_place_moving(frame)
+                elif self.state == RobotState.PICK_PLACE_GRASPING:
+                    self._handle_pick_place_grasping()
 
                 # --- Шаг 4: Отображение и задержка ---
                 self.vision.display_frame(frame, "Vintix Control")
@@ -111,14 +118,14 @@ class VintixRunner:
         if command_type == Command.PICK_UP:
             if self.state == RobotState.IDLE:
                 target_color = command.get('data')
-                logger.info(f"Получена команда на захват объекта цвета: {target_color}. Переход в состояние PICK_PLACE.")
+                logger.info(f"Получена команда на захват объекта цвета: {target_color}. Переход в состояние планирования.")
                 self._start_pick_place_task(target_color)
             else:
                 logger.warning("Получена команда на захват, но робот уже занят. Команда проигнорирована.")
 
         elif command_type == Command.GO_HOME:
             logger.info("Выполняется команда 'домой'.")
-            if self.state == RobotState.PICK_PLACE:
+            if self.state == RobotState.PICK_PLACE_MOVING or self.state == RobotState.PICK_PLACE_PLANNING:
                 logger.warning("Задача прервана командой 'домой'.")
             self.state = RobotState.IDLE
             self.robot_controller.go_home()
@@ -129,7 +136,7 @@ class VintixRunner:
 
     def _start_pick_place_task(self, target_color: str):
         """Инициализирует новую задачу 'взять и положить'."""
-        self.state = RobotState.PICK_PLACE
+        self.state = RobotState.PICK_PLACE_PLANNING
         self.agent.reset()
         self.datalogger.reset_episode_buffer()
 
@@ -137,11 +144,15 @@ class VintixRunner:
             "target_color": target_color,
             "step": 0,
             "last_reward": 0.0,
-            "target_world_coords": None
+            "target_world_coords": None,
+            "next_joint_angles": None
         }
 
-    def _run_pick_place_step(self, frame: np.ndarray) -> np.ndarray:
-        """Выполняет один шаг эпизода 'взять и положить'."""
+    def _handle_pick_place_planning(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Выполняет один шаг планирования: поиск цели, получение действия от агента
+        и отправка команды на движение.
+        """
         task = self.pick_place_task
         step = task["step"]
         
@@ -157,56 +168,94 @@ class VintixRunner:
 
         # Получаем текущее состояние робота
         current_angles_rad = self.robot_controller.get_current_angles_rad()
+        
+        # Формируем вектор наблюдения (только проприоцепция).
+        observation = np.array(current_angles_rad)
+        
+        # Получение действия от агента
+        action_delta = self.agent.get_next_action(observation, task["last_reward"])
+        
+        # Применяем дельту к текущим углам
+        new_target_angles = np.array(current_angles_rad)
+        new_target_angles[:3] += action_delta
+        
+        # Отправляем команду на движение, но НЕ ждем ее выполнения
+        self.robot_controller.move_to_angles_rad(list(new_target_angles))
+        
+        # Сохраняем целевые углы для последующего обновления состояния
+        task["next_joint_angles"] = list(new_target_angles)
+        
+        # Переключаем состояние на ожидание движения
+        self.state = RobotState.PICK_PLACE_MOVING
+        logger.debug(f"Шаг {step}: команда на движение отправлена, переход в состояние MOVING.")
+
+        return debug_frame
+
+    def _handle_pick_place_moving(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Ожидает завершения движения робота, затем оценивает результат.
+        """
+        if self.robot_controller.is_moving():
+            # Движение еще не завершено, ничего не делаем
+            return frame
+
+        # Движение завершено, можно оценивать результат
+        task = self.pick_place_task
+        step = task["step"]
+        logger.debug(f"Шаг {step}: движение завершено, оценка результата.")
+
+        # 1. Обновляем внутреннее состояние контроллера робота
+        self.robot_controller.set_current_angles_rad(task["next_joint_angles"])
+        
+        # 2. Получаем новую позицию эффектора
         end_effector_pos = self.robot_controller.get_end_effector_position()
         if end_effector_pos is None:
             logger.error("Не удалось получить позицию эффектора, прерывание задачи.")
             self.state = RobotState.IDLE
-            return debug_frame
+            return frame
 
-        # Формируем вектор наблюдения (только проприоцепция).
-        # Модель industrial-benchmark ожидает вектор из 6 углов.
-        observation = current_angles_rad
-        
-        # Получение действия от агента
-        # Агент выдает действие в виде ИЗМЕНЕНИЯ углов (дельты) для первых 3-х суставов.
-        action_delta = self.agent.get_next_action(observation, task["last_reward"])
-        
-        # Применяем дельту к текущим углам
-        # Важно: action_delta имеет размерность (3,), применяем его только к первым трем суставам.
-        new_target_angles = np.array(current_angles_rad)
-        new_target_angles[:3] += action_delta
-        
-        self.robot_controller.move_to_angles_rad(list(new_target_angles))
-        
-        # Вычисляем вознаграждение и проверяем условие успеха
+        # 3. Вычисляем вознаграждение и проверяем условие успеха
         is_success = False
+        target_world_coords = task.get("target_world_coords")
+
         if target_world_coords is not None:
             distance_to_target = np.linalg.norm(target_world_coords - end_effector_pos)
-            task["last_reward"] = -distance_to_target # Вознаграждение обратно пропорционально расстоянию
+            task["last_reward"] = -distance_to_target
             
             if distance_to_target < settings.agent.episode.SUCCESS_THRESHOLD:
                 is_success = True
-                task["last_reward"] = 1.0 # Финальная награда за успех
+                task["last_reward"] = 1.0
         else:
-            task["last_reward"] = -0.1 # Штраф за потерю цели
+            task["last_reward"] = -0.1
 
-        # Логируем шаг
+        # 4. Логируем шаг
+        observation = np.array(task["next_joint_angles"])
+        # Важно: логируем action, который привел к этому состоянию
+        action_delta = observation[:3] - np.array(self.robot_controller.get_current_angles_rad())[:3]
+        
         self.datalogger.log_step(observation, action_delta, task["last_reward"], step)
         
-        # Обработка завершения эпизода (успех или провал по шагам)
+        # 5. Обработка завершения эпизода
+        task["step"] += 1
         if is_success:
-            logger.info(f"ЗАХВАТ! Эпизод успешно завершен на шаге {step+1}.")
+            logger.info(f"УСПЕХ! Эпизод завершен на шаге {task['step']}.")
             self.datalogger.finish_episode(final_reward=1.0)
-            self._perform_grasp_sequence()
-            self.state = RobotState.IDLE # Возвращаемся в режим ожидания
-        elif step >= settings.agent.episode.MAX_STEPS -1:
+            self.state = RobotState.PICK_PLACE_GRASPING
+        elif task["step"] >= settings.agent.episode.MAX_STEPS:
             logger.warning(f"ПРОВАЛ. Эпизод не завершился за {settings.agent.episode.MAX_STEPS} шагов.")
             self.datalogger.finish_episode(final_reward=-1.0)
-            self.state = RobotState.IDLE # Возвращаемся в режим ожидания
-
-        task["step"] += 1
-        return debug_frame
+            self.state = RobotState.IDLE
+        else:
+            # Если эпизод продолжается, возвращаемся к планированию
+            self.state = RobotState.PICK_PLACE_PLANNING
+        
+        return frame
     
+    def _handle_pick_place_grasping(self):
+        """Выполняет физическую последовательность захвата и возвращения домой."""
+        self._perform_grasp_sequence()
+        self.state = RobotState.IDLE # Возвращаемся в режим ожидания
+
     def _perform_grasp_sequence(self):
         """Выполняет физическую последовательность захвата и возвращения домой."""
         logger.info("Выполнение последовательности захвата...")
@@ -248,7 +297,6 @@ class VintixRunner:
 
 
 if __name__ == '__main__':
-    setup_logging(name="VintixRunner", level=settings.system.LOG_LEVEL)
     runner = VintixRunner()
     if runner.running:
         runner.run()
