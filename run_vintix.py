@@ -3,234 +3,252 @@ Main executable file for the Vintix-powered robot control loop.
 Orchestrates all modules to run the robot.
 """
 import logging
-import queue
 import time
 import cv2
 import numpy as np
+from enum import Enum, auto
 
-# --- Module Imports ---
-from robot_controller import RobotController
-from vintix_agent import VintixAgent
+from config import settings
 from vision import Vision
-from voice_control import VoiceCommandHandler
+from vintix_agent import VintixAgent
+from robot_controller import RobotController
 from coordinate_mapper import CoordinateMapper
+from voice_control import VoiceControl, Command
+from utils import setup_logging, GracefulShutdown
 from datalogger import HDF5Logger
 
-# --- Configuration ---
-LOG_LEVEL = logging.INFO
-ESP32_IP = "192.168.1.10"  # !!! IMPORTANT: Change this to your ESP32's IP address !!!
-URDF_PATH = "manipulator.urdf"
-VINTIX_MODEL_PATH = "models/vintix_checkpoint"
-SUCCESS_THRESHOLD_METERS = 0.02  # 2 сантиметра до цели
-MAX_EPISODE_STEPS = 200 # Максимальное количество шагов в одной попытке
-
-# Basic logging setup
-logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("Corobot")
+logger = logging.getLogger(__name__)
 
 
-class CorobotSystem:
-    """The main class that orchestrates the entire robot system."""
+class RobotState(Enum):
+    """Состояния конечного автомата для управления роботом."""
+    IDLE = auto()          # Ожидание команд
+    PICK_PLACE = auto()    # Выполнение задачи "взять и положить"
+
+
+class VintixRunner:
+    """
+    Главный класс, который инициализирует все компоненты и управляет основным циклом.
+    """
 
     def __init__(self):
-        logger.info("Initializing Corobot System...")
-        self.running = True
-        self.target_color = None
-        self.is_episode_active = False
-        self.episode_step_counter = 0
-        self.command_queue = queue.Queue()
-
-        # Initialize core components
+        logger.info("Инициализация Vintix Corobot...")
+        self.shutdown_manager = GracefulShutdown()
+        
         try:
-            self.robot = RobotController(urdf_path=URDF_PATH, esp32_ip=ESP32_IP)
-            self.agent = VintixAgent(model_path=VINTIX_MODEL_PATH)
-            self.vision = Vision(camera_id=0)
-            self.voice = VoiceCommandHandler(command_queue=self.command_queue)
-            self.mapper = CoordinateMapper()
-            self.logger = HDF5Logger(log_dir="data/training_logs")
+            # --- Инициализация компонентов ---
+            self.robot_controller = RobotController()
+            self.vision = Vision()
+            self.agent = VintixAgent(
+                model_path=settings.agent.MODEL_PATH
+            )
+            self.mapper = CoordinateMapper(
+                work_plane_z=settings.vision.TARGET_Z_COORD_M
+            )
+            self.voice_control = VoiceControl(
+                model_path=settings.voice.MODEL_PATH
+            )
+            self.datalogger = HDF5Logger(
+                log_dir=settings.datalogger.LOG_DIR
+            )
+            
+            # --- Инициализация конечного автомата ---
+            self.state = RobotState.IDLE
+            self.running = True
+            self.pick_place_task = {} # Словарь для хранения параметров текущей задачи
 
-            if not self.vision.initialize_camera():
-                raise ConnectionError("Failed to initialize camera.")
+            logger.info("Все компоненты успешно инициализированы.")
 
         except Exception as e:
-            logger.critical(f"Failed to initialize a core component: {e}")
+            logger.critical(f"Критическая ошибка при инициализации: {e}", exc_info=True)
             self.running = False
 
     def run(self):
-        """Starts the main control loop."""
+        """
+        Запускает основной рабочий цикл.
+        """
         if not self.running:
-            logger.critical("System cannot run due to initialization failure.")
+            logger.error("Запуск невозможен из-за ошибки инициализации.")
             return
 
-        self.voice.start_listening()
-        logger.info("System is running. Press 'q' in the OpenCV window to quit.")
-
+        logger.info("Vintix Corobot запущен. Запуск фонового прослушивания...")
+        self.voice_control.start()
+        
         try:
-            while self.running:
-                # 1. Get a fresh frame from the camera
+            while self.running and not self.shutdown_manager.is_shutting_down():
+                # --- Шаг 1: Получение данных извне ---
                 frame = self.vision.get_frame()
                 if frame is None:
-                    time.sleep(0.1)
+                    logger.warning("Не удалось получить кадр, пропуск итерации.")
+                    time.sleep(0.5)
                     continue
 
-                # 2. Process inputs (voice commands)
-                self._handle_voice_commands()
+                voice_command = self.voice_control.get_command()
 
-                # 3. Perceive the environment (Vision)
-                all_objects = self.vision.find_colored_objects(frame)
-                
-                # 4. Decide and Act (Vintix + Robot Control)
-                if self.is_episode_active:
-                    if self.target_color and self.target_color in all_objects and all_objects[self.target_color]:
-                        # Цель видна, выполняем шаг Vintix
-                        self._vintix_step(all_objects)
-                    else:
-                        # Цель пропала во время выполнения
-                        logger.warning(f"Target '{self.target_color}' lost. Ending episode as failure.")
-                        self._end_episode(success=False)
-                
-                # 5. Visualize
-                self._visualize(frame, all_objects)
+                # --- Шаг 2: Обработка команд и обновление состояния ---
+                if voice_command:
+                    self._handle_voice_command(voice_command)
 
-                # 6. User exit
+                # --- Шаг 3: Выполнение действий в зависимости от состояния ---
+                if self.state == RobotState.PICK_PLACE:
+                    frame = self._run_pick_place_step(frame)
+
+                # --- Шаг 4: Отображение и задержка ---
+                self.vision.display_frame(frame, "Vintix Control")
                 if cv2.waitKey(1) & 0xFF == ord('q'):
+                    logger.info("Нажата клавиша 'q', завершение работы.")
                     self.running = False
+                
+                time.sleep(0.05) # Небольшая задержка, чтобы не загружать CPU
+
         finally:
             self.shutdown()
 
-    def _vintix_step(self, all_objects):
-        """Performs one step of the Vintix control loop."""
-        # a. Get target coordinates
-        target_pixel_coords = all_objects[self.target_color][0] # Take the first detected object
-        
-        # b. Map to robot's world coordinates (currently using a placeholder mapping)
-        # NOTE: This mapping needs to be calibrated for real-world accuracy.
-        target_world_coords = self.mapper.pixel_to_robot(target_pixel_coords[0], target_pixel_coords[1])
-        
-        # c. Get robot's current state
-        current_joint_angles = self.robot.get_current_angles_rad()
+    def _handle_voice_command(self, command: dict):
+        """Обрабатывает команды из голосового модуля и меняет состояние."""
+        command_type = command.get('type')
 
-        # d. Form the observation vector for the agent
-        # The observation space for Vintix is often a concatenation of robot state and goal state
-        observation = np.concatenate([
-            np.array(current_joint_angles),
-            np.array(target_world_coords)
-        ]).astype(np.float32)
-        
-        # e. Get action from Vintix
-        # We are not implementing a reward function yet, so reward is always 0.
-        action_rad = self.agent.get_action(observation, prev_reward=0.0)
-        
-        # g. Log the step data
-        self.logger.log_step(observation, action_rad, 0.0, self.episode_step_counter)
-        self.episode_step_counter += 1
-        
-        # h. Execute the action
-        self.robot.move_to_angles_rad(action_rad.tolist())
+        if command_type == Command.PICK_UP:
+            if self.state == RobotState.IDLE:
+                target_color = command.get('data')
+                logger.info(f"Получена команда на захват объекта цвета: {target_color}. Переход в состояние PICK_PLACE.")
+                self._start_pick_place_task(target_color)
+            else:
+                logger.warning("Получена команда на захват, но робот уже занят. Команда проигнорирована.")
 
-        # i. Check for success condition
-        end_effector_pos = self.robot.get_end_effector_position()
-        distance_to_target = np.linalg.norm(np.array(end_effector_pos) - np.array(target_world_coords))
-        logger.debug(f"Step: {self.episode_step_counter}, Distance to target: {distance_to_target:.4f}m")
-
-        if distance_to_target < SUCCESS_THRESHOLD_METERS:
-            logger.info(f"Success! Reached target within {SUCCESS_THRESHOLD_METERS}m threshold.")
-            self._end_episode(success=True)
+        elif command_type == Command.GO_HOME:
+            logger.info("Выполняется команда 'домой'.")
+            if self.state == RobotState.PICK_PLACE:
+                logger.warning("Задача прервана командой 'домой'.")
+            self.state = RobotState.IDLE
+            self.robot_controller.go_home()
         
-        elif self.episode_step_counter >= MAX_EPISODE_STEPS:
-            logger.warning(f"Max steps ({MAX_EPISODE_STEPS}) reached. Ending episode as failure.")
-            self._end_episode(success=False)
+        elif command_type == Command.STOP:
+            logger.info("Получена команда 'стоп', завершение работы.")
+            self.running = False
 
-    def _handle_voice_commands(self):
-        """Check the queue for voice commands and update state."""
-        try:
-            command = self.command_queue.get_nowait()
-            logger.info(f"Received command: {command}")
-            action = command.get('action')
+    def _start_pick_place_task(self, target_color: str):
+        """Инициализирует новую задачу 'взять и положить'."""
+        self.state = RobotState.PICK_PLACE
+        self.agent.reset()
+        self.datalogger.reset_episode_buffer()
 
-            if action == 'grab':
-                target = command.get('target')
-                if target in ['red', 'green', 'blue']:
-                    logger.info(f"Starting new episode for target: {target}")
-                    self.target_color = target
-                    self._start_new_episode()
+        self.pick_place_task = {
+            "target_color": target_color,
+            "step": 0,
+            "last_reward": 0.0,
+            "target_world_coords": None
+        }
+
+    def _run_pick_place_step(self, frame: np.ndarray) -> np.ndarray:
+        """Выполняет один шаг эпизода 'взять и положить'."""
+        task = self.pick_place_task
+        step = task["step"]
+        
+        # Найти объект и получить его 3D координаты
+        pixel_coords, debug_frame = self.vision.find_object_by_color(frame, task["target_color"], draw_debug=True)
+        
+        if pixel_coords:
+            target_world_coords = self.mapper.pixel_to_world(pixel_coords['x'], pixel_coords['y'])
+            task["target_world_coords"] = target_world_coords
+        else:
+            logger.warning(f"На шаге {step} не удалось найти цель цвета {task['target_color']}.")
+            target_world_coords = None
+
+        # Получаем текущее состояние робота
+        current_angles_rad = self.robot_controller.get_current_angles_rad()
+        end_effector_pos = self.robot_controller.get_end_effector_position()
+        if end_effector_pos is None:
+            logger.error("Не удалось получить позицию эффектора, прерывание задачи.")
+            self.state = RobotState.IDLE
+            return debug_frame
+
+        # Формируем вектор наблюдения (только проприоцепция).
+        # Модель industrial-benchmark ожидает вектор из 6 углов.
+        observation = current_angles_rad
+        
+        # Получение действия от агента
+        # Агент выдает действие в виде ИЗМЕНЕНИЯ углов (дельты) для первых 3-х суставов.
+        action_delta = self.agent.get_next_action(observation, task["last_reward"])
+        
+        # Применяем дельту к текущим углам
+        # Важно: action_delta имеет размерность (3,), применяем его только к первым трем суставам.
+        new_target_angles = np.array(current_angles_rad)
+        new_target_angles[:3] += action_delta
+        
+        self.robot_controller.move_to_angles_rad(list(new_target_angles))
+        
+        # Вычисляем вознаграждение и проверяем условие успеха
+        is_success = False
+        if target_world_coords is not None:
+            distance_to_target = np.linalg.norm(target_world_coords - end_effector_pos)
+            task["last_reward"] = -distance_to_target # Вознаграждение обратно пропорционально расстоянию
             
-            elif action == 'stop':
-                logger.info("User requested STOP. Ending episode as failure.")
-                if self.is_episode_active:
-                    self._end_episode(success=False)
-                self.robot.go_home()
+            if distance_to_target < settings.agent.episode.SUCCESS_THRESHOLD:
+                is_success = True
+                task["last_reward"] = 1.0 # Финальная награда за успех
+        else:
+            task["last_reward"] = -0.1 # Штраф за потерю цели
 
-            elif action == 'home':
-                if self.is_episode_active:
-                    logger.warning("Returning home, current episode is cancelled (failure).")
-                    self._end_episode(success=False)
-                self.robot.go_home()
-
-        except queue.Empty:
-            # No commands, which is normal
-            pass
-
-    def _start_new_episode(self):
-        """Resets necessary states and components for a new task."""
-        self.is_episode_active = True
-        self.episode_step_counter = 0
-        self.agent.reset()  # Reset agent's context (short-term memory)
-        self.logger.reset_episode_buffer() # Reset our logger
-        logger.info("Episode started. Logger and Agent are ready.")
-
-    def _end_episode(self, success: bool):
-        """Handles the end of an episode, logging and resetting state."""
-        if not self.is_episode_active:
-            return # Avoid multiple endings
-
-        final_reward = 1.0 if success else -1.0
-        logger.info(f"Ending episode. Success: {success}, Final Reward: {final_reward}")
+        # Логируем шаг
+        self.datalogger.log_step(observation, action_delta, task["last_reward"], step)
         
-        self.logger.finish_episode(final_reward)
-        self.is_episode_active = False
-        self.target_color = None
+        # Обработка завершения эпизода (успех или провал по шагам)
+        if is_success:
+            logger.info(f"ЗАХВАТ! Эпизод успешно завершен на шаге {step+1}.")
+            self.datalogger.finish_episode(final_reward=1.0)
+            self._perform_grasp_sequence()
+            self.state = RobotState.IDLE # Возвращаемся в режим ожидания
+        elif step >= settings.agent.episode.MAX_STEPS -1:
+            logger.warning(f"ПРОВАЛ. Эпизод не завершился за {settings.agent.episode.MAX_STEPS} шагов.")
+            self.datalogger.finish_episode(final_reward=-1.0)
+            self.state = RobotState.IDLE # Возвращаемся в режим ожидания
 
-        if success:
-            # Perform the actual grab and return home
-            logger.info("Performing grab action and returning home.")
-            self.robot.set_gripper(open_gripper=False) # Close gripper
-            time.sleep(1)
-            self.robot.go_home()
-            time.sleep(1)
-            self.robot.set_gripper(open_gripper=True) # Open gripper at home
+        task["step"] += 1
+        return debug_frame
+    
+    def _perform_grasp_sequence(self):
+        """Выполняет физическую последовательность захвата и возвращения домой."""
+        logger.info("Выполнение последовательности захвата...")
+        gripper_delay = settings.robot.gripper.ACTION_DELAY_SEC
+        
+        self.robot_controller.close_gripper()
+        time.sleep(gripper_delay)
+        
+        # Немного приподнять объект перед движением домой
+        current_pos = self.robot_controller.get_end_effector_position()
+        if current_pos is not None:
+            target_pos = current_pos + np.array([0, 0, 0.05]) # Поднять на 5 см
+            ik_solution = self.robot_controller.calculate_ik(target_pos.tolist())
+            if ik_solution:
+                self.robot_controller.move_to_angles_rad(ik_solution)
+                time.sleep(gripper_delay)
 
-    def _visualize(self, frame, all_objects):
-        """Displays the camera feed and overlays debug information."""
-        # Draw all detected objects
-        for color, objects in all_objects.items():
-            for (x, y) in objects:
-                cv2.circle(frame, (x, y), 5, (0, 255, 255), -1)
-
-        # Highlight the current target
-        if self.target_color and self.target_color in all_objects and all_objects[self.target_color]:
-            x, y = all_objects[self.target_color][0]
-            cv2.circle(frame, (x, y), 15, (0, 255, 0), 2)
-            cv2.putText(frame, f"TARGET: {self.target_color}", (x + 20, y + 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        cv2.imshow("Corobot Vintix Control", frame)
+        self.robot_controller.go_home()
+        time.sleep(gripper_delay)
+        
+        self.robot_controller.open_gripper()
+        logger.info("Последовательность захвата завершена.")
 
 
     def shutdown(self):
-        """Properly closes all resources."""
-        logger.info("Shutting down Corobot System...")
-        if self.is_episode_active:
-            # Ensure any active episode is logged as a failure on shutdown
-            logger.warning("System shutting down during an active episode. Logging as failure.")
-            self._end_episode(success=False)
-            
-        self.voice.stop_listening()
-        self.vision.release_camera()
-        self.robot.shutdown()
+        """
+        Освобождает все ресурсы.
+        """
+        logger.info("Завершение работы Vintix Corobot...")
+        if hasattr(self, 'voice_control'):
+            self.voice_control.stop()
+        if hasattr(self, 'robot_controller'):
+            self.robot_controller.shutdown()
+        if hasattr(self, 'vision'):
+            self.vision.release()
+        
         cv2.destroyAllWindows()
+        logger.info("Все ресурсы освобождены. Выход.")
 
-if __name__ == "__main__":
-    system = CorobotSystem()
-    system.run()
-    logger.info("System has shut down.") 
+
+if __name__ == '__main__':
+    setup_logging(name="VintixRunner", level=settings.system.LOG_LEVEL)
+    runner = VintixRunner()
+    if runner.running:
+        runner.run()

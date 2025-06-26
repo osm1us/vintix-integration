@@ -41,7 +41,7 @@ import cv2
 import numpy as np
 import os
 import argparse
-import json
+import yaml
 from datetime import datetime
 
 def calibrate_camera(images_path, chessboard_rows, chessboard_cols, square_size):
@@ -144,20 +144,22 @@ def calibrate_camera(images_path, chessboard_rows, chessboard_cols, square_size)
         print("Отличный результат! Ошибка < 1.0 пикселя.")
 
     # Сохранение результатов в файл
-    output_filename = "camera_params.json"
+    output_filename = "camera_params.yaml"
     data = {
         "calibration_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "image_resolution": image_shape,
         "chessboard_size": (chessboard_cols, chessboard_rows),
         "square_size_cm": square_size,
         "camera_matrix": camera_matrix.tolist(),
-        "distortion_coefficients": dist_coeffs.tolist(),
+        "dist_coeff": dist_coeffs.tolist(),
+        "rvecs": [r.tolist() for r in rvecs],
+        "tvecs": [t.tolist() for t in tvecs],
         "reprojection_error": mean_error_avg
     }
 
     try:
         with open(output_filename, 'w') as f:
-            json.dump(data, f, indent=4)
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
         print(f"\nПараметры калибровки сохранены в файл: {output_filename}")
     except Exception as e:
         print(f"\nОшибка при сохранении файла: {e}")

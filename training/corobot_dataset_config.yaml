@@ -1,7 +1,0 @@
-# Dataset configuration for our custom Corobot task
-corobot_task:
-  path: data/training_logs  # Путь к директории с HDF5 лог-файлами
-  type: "default"           # Стандартный тип датасета
-  reward_scale: 1.0         # Множитель для наград (оставляем 1.0)
-  episode_sparsity: 1       # Использовать каждый эпизод из логов
-  group: "corobot"          # Имя для нашей группы задач 

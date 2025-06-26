@@ -1,229 +1,168 @@
 """
 Сопоставление координат: пиксели -> реальный мир.
 
-Этот модуль представляет собой второй и ключевой этап настройки "зрения" робота.
-После того как камера откалибрована (искажения устранены), этот модуль
-позволяет создать точное сопоставление между 2D-координатами на изображении
-и 2D-координатами на реальной рабочей плоскости (например, на столе).
+Этот модуль позволяет создать точное сопоставление между 2D-координатами на 
+изображении и реальными мировыми координатами на рабочей плоскости (например, на столе).
 
 Принцип работы:
-1.  **Устранение дисторсии**: Сначала пиксельные координаты исправляются с
-    помощью параметров, полученных на этапе калибровки камеры.
-2.  **Гомография**: Используется матрица гомографии (3x3) для перевода
-    "чистых" пиксельных координат в реальные мировые координаты (например, в см).
-    Эта матрица вычисляется один раз на основе 4-х пар точек:
-    ты указываешь 4 пиксельные координаты на изображении и соответствующие
-    им 4 реальные координаты на столе.
+1.  **Загрузка калибровки**: Модуль загружает параметры камеры, включая
+    матрицу камеры, коэффициенты дисторсии, а также векторы вращения (rvecs) и 
+    трансляции (tvecs) из файла `camera_params.yaml`. Эти векторы описывают
+    положение калибровочной доски относительно камеры.
+2.  **Вычисление гомографии**: На основе этих векторов и матрицы камеры
+    вычисляется матрица гомографии. Эта матрица позволяет "спроецировать"
+    пиксельные координаты на рабочую плоскость, положение которой было
+    зафиксировано во время калибровки.
+3.  **Преобразование**: Метод `pixel_to_world` использует вычисленную
+    матрицу для преобразования любой точки с изображения в реальные координаты.
 
 Как использовать:
-1.  Убедись, что у тебя есть файл `camera_params.json`, полученный
-    после запуска `camera_calibration.py`.
-2.  Запусти интерактивный скрипт или используй `main.py` для отображения
-    видеопотока с камеры.
-3.  Определи 4 опорные точки на рабочей плоскости (например, углы белого листа А4).
-    - Запиши их пиксельные координаты `(u, v)` с видеопотока.
-    - Измерь их реальные координаты `(X, Y)` линейкой от точки отсчета робота.
-4.  Используй метод `calculate_and_save_homography`, передав ему эти 4 пары точек.
-    Он создаст файл `homography_matrix.json`.
-5.  После этого `CoordinateMapper` готов к работе: метод `pixel_to_world` будет
-    преобразовывать любые пиксели в реальные координаты.
+1.  Запустите `camera_calibration.py` для получения файла `camera_params.yaml`.
+2.  Убедитесь, что путь к этому файлу правильно указан в `config.py`.
+3.  Создайте экземпляр `CoordinateMapper`, и он будет готов к работе.
 """
 
 import cv2
 import numpy as np
 import json
 import os
+import yaml
+import logging
+
+from config import settings
+
+logger = logging.getLogger(__name__)
 
 class CoordinateMapper:
     """
-    Класс для преобразования пиксельных координат в мировые координаты.
+    Преобразует 2D координаты с изображения камеры в 3D мировые координаты робота.
     """
-    def __init__(self, camera_params_path="camera_params.json", homography_path="homography_matrix.json"):
+
+    def __init__(self, work_plane_z: float = 0.0):
         """
-        Инициализирует маппер.
+        Инициализирует маппер с использованием файла калибровки из глобальных настроек.
 
         Args:
-            camera_params_path (str): Путь к файлу с параметрами камеры.
-            homography_path (str): Путь к файлу с матрицей гомографии.
+            work_plane_z (float): Высота рабочей плоскости по оси Z в мировых координатах.
         """
-        self.camera_matrix = None
-        self.dist_coeffs = None
-        self.homography_matrix = None
-        self.is_ready = False
+        self.work_plane_z = work_plane_z
+        self.mtx = None
+        self.dist = None
+        self.rvecs = None
+        self.tvecs = None
+        self.inv_homography_matrix = None
+        
+        calibration_file = settings.system.CAMERA_PARAMS_PATH
 
-        # 1. Загружаем параметры калибровки камеры
-        if not os.path.exists(camera_params_path):
-            print(f"Предупреждение: Файл параметров камеры '{camera_params_path}' не найден.")
-            print("Необходимо сначала запустить camera_calibration.py")
-        else:
-            try:
-                with open(camera_params_path, 'r') as f:
-                    params = json.load(f)
-                    self.camera_matrix = np.array(params["camera_matrix"])
-                    self.dist_coeffs = np.array(params["distortion_coefficients"])
-                print(f"Параметры камеры успешно загружены из '{camera_params_path}'.")
-            except Exception as e:
-                print(f"Ошибка при загрузке параметров камеры: {e}")
-                return
+        if not self._load_calibration(calibration_file):
+            raise ValueError(f"Не удалось загрузить или обработать файл калибровки: {calibration_file}")
 
-        # 2. Загружаем матрицу гомографии
-        if not os.path.exists(homography_path):
-            print(f"Предупреждение: Файл матрицы гомографии '{homography_path}' не найден.")
-            print("Используйте метод 'calculate_and_save_homography', чтобы создать его.")
-        else:
-            self.load_homography_matrix(homography_path)
-
-        self._check_if_ready()
-
-    def _check_if_ready(self):
-        """Проверяет, готовы ли все компоненты для работы."""
-        if self.camera_matrix is not None and self.dist_coeffs is not None and self.homography_matrix is not None:
-            self.is_ready = True
-            print("CoordinateMapper готов к работе.")
-        else:
-            self.is_ready = False
-            print("CoordinateMapper не готов. Проверьте файлы конфигурации.")
-
-    def load_homography_matrix(self, path="homography_matrix.json"):
-        """
-        Загружает матрицу гомографии из файла.
-
-        Args:
-            path (str): Путь к файлу.
-        """
+    def _load_calibration(self, file_path: str) -> bool:
+        """Загружает данные калибровки из YAML файла."""
         try:
-            with open(path, 'r') as f:
-                data = json.load(f)
-                self.homography_matrix = np.array(data['homography_matrix'])
-            print(f"Матрица гомографии успешно загружена из '{path}'.")
-            self._check_if_ready()
-        except Exception as e:
-            print(f"Ошибка при загрузке матрицы гомографии: {e}")
-            self.homography_matrix = None
+            with open(file_path, 'r') as f:
+                calib_data = yaml.safe_load(f)
+            
+            self.mtx = np.array(calib_data["camera_matrix"])
+            self.dist = np.array(calib_data["dist_coeff"])
+            self.rvecs = np.array(calib_data["rvecs"])
+            self.tvecs = np.array(calib_data["tvecs"])
 
-    def calculate_and_save_homography(self, pixel_points, world_points, path="homography_matrix.json"):
-        """
-        Вычисляет и сохраняет матрицу гомографии.
-
-        Args:
-            pixel_points (list of tuples): Список 4-х пиксельных координат (u, v).
-            world_points (list of tuples): Список 4-х соответствующих мировых координат (X, Y).
-            path (str): Путь для сохранения файла.
-        """
-        if self.camera_matrix is None:
-            print("Ошибка: Параметры камеры не загружены. Невозможно вычислить гомографию.")
-            return False
-
-        if len(pixel_points) != 4 or len(world_points) != 4:
-            raise ValueError("Необходимо ровно 4 пары точек для вычисления гомографии.")
-
-        # Сначала "выпрямляем" пиксельные координаты
-        pixel_points_np = np.array(pixel_points, dtype=np.float32).reshape(-1, 1, 2)
-        undistorted_pixel_points = cv2.undistortPoints(pixel_points_np, self.camera_matrix, self.dist_coeffs, None, self.camera_matrix)
-
-        # Вычисляем матрицу гомографии
-        self.homography_matrix, status = cv2.findHomography(undistorted_pixel_points, np.array(world_points))
-
-        if self.homography_matrix is None:
-            print("Не удалось вычислить матрицу гомографии. Проверьте точки.")
-            return False
-
-        # Сохраняем матрицу
-        try:
-            data = {"homography_matrix": self.homography_matrix.tolist()}
-            with open(path, 'w') as f:
-                json.dump(data, f, indent=4)
-            print(f"Матрица гомографии успешно вычислена и сохранена в '{path}'.")
-            self._check_if_ready()
+            logger.info(f"Данные калибровки успешно загружены из {file_path}")
+            
+            # Рассчитываем матрицу гомографии при загрузке
+            self._compute_homography()
             return True
-        except Exception as e:
-            print(f"Ошибка при сохранении матрицы гомографии: {e}")
+
+        except FileNotFoundError:
+            logger.error(f"Файл калибровки не найден: {file_path}")
+            return False
+        except (KeyError, TypeError) as e:
+            logger.error(f"Ошибка в структуре файла калибровки {file_path}: {e}")
             return False
 
-    def pixel_to_world(self, u, v):
+    def _compute_homography(self):
         """
-        Преобразует одну пиксельную координату (u, v) в мировую (X, Y).
+        Рассчитывает матрицу гомографии для преобразования координат.
+        Этот метод был значительно упрощен, так как camera_calibration.py
+        теперь сохраняет rvecs и tvecs.
+        """
+        if self.rvecs is None or self.tvecs is None:
+            logger.error("Невозможно рассчитать гомографию: отсутствуют векторы вращения или трансляции.")
+            return
+
+        # Используем первый вектор вращения и трансляции
+        rvec = self.rvecs[0]
+        tvec = self.tvecs[0]
+        
+        # Преобразуем вектор вращения в матрицу вращения
+        R, _ = cv2.Rodrigues(rvec)
+        
+        # Собираем матрицу гомографии.
+        # Исключаем Z-компоненту из матрицы вращения, так как мы проецируем на плоскость.
+        H = np.hstack((R[:, 0:2], tvec))
+        H_inv = np.linalg.inv(self.mtx @ H)
+        
+        self.inv_homography_matrix = H_inv
+        logger.info("Матрица гомографии успешно рассчитана и инвертирована.")
+
+
+    def pixel_to_world(self, u: int, v: int) -> np.ndarray | None:
+        """
+        Преобразует 2D пиксельные координаты (u, v) в 3D мировые координаты (X, Y, Z).
 
         Args:
-            u (int or float): Пиксельная координата X.
-            v (int or float): Пиксельная координата Y.
+            u (int): Координата X на изображении (пиксель).
+            v (int): Координата Y на изображении (пиксель).
 
         Returns:
-            tuple: Кортеж (X, Y) в мировых координатах или None, если система не готова.
+            np.ndarray: Массив [X, Y, Z] в мировых координатах или None.
         """
-        if not self.is_ready:
-            print("Ошибка: CoordinateMapper не готов к преобразованию.")
+        if self.inv_homography_matrix is None:
+            logger.error("Преобразование невозможно: матрица гомографии не рассчитана.")
             return None
 
-        # 1. "Выпрямляем" точку
-        pixel_coords = np.array([[[u, v]]], dtype=np.float32)
-        undistorted_coords = cv2.undistortPoints(pixel_coords, self.camera_matrix, self.dist_coeffs, None, self.camera_matrix)
+        pixel_coords_homogeneous = np.array([u, v, 1], dtype=np.float32)
+        world_coords_2d_homogeneous = self.inv_homography_matrix @ pixel_coords_homogeneous
         
-        # 2. Применяем гомографию
-        # Нам нужно передать точку в гомогенных координатах (u, v, 1)
-        uv_hom = np.array([undistorted_coords[0][0][0], undistorted_coords[0][0][1], 1])
-        xyw_hom = self.homography_matrix @ uv_hom
-        
-        # 3. Нормализуем, разделив на w
-        if xyw_hom[2] != 0:
-            x = xyw_hom[0] / xyw_hom[2]
-            y = xyw_hom[1] / xyw_hom[2]
-            return (x, y)
-        else:
+        # Нормализуем, чтобы последняя компонента была 1
+        if world_coords_2d_homogeneous[2] == 0:
+            logger.error("Ошибка при преобразовании координат: деление на ноль.")
             return None
-
-# Пример использования (раскомментировать, когда будут реальные данные)
-if __name__ == '__main__':
-    print("Демонстрация работы CoordinateMapper.")
-
-    # Создаем "заглушки" для файлов, чтобы продемонстрировать вычисление
-    if not os.path.exists("camera_params.json"):
-        print("\nСоздаем тестовый файл 'camera_params.json'...")
-        dummy_cam_params = {
-            "camera_matrix": [[1000, 0, 640], [0, 1000, 360], [0, 0, 1]],
-            "distortion_coefficients": [[0, 0, 0, 0, 0]]
-        }
-        with open("camera_params.json", 'w') as f:
-            json.dump(dummy_cam_params, f, indent=4)
-    
-    # 1. Инициализация. Он увидит, что матрицы гомографии нет.
-    mapper = CoordinateMapper()
-
-    # 2. Вычисление матрицы гомографии (это нужно будет сделать один раз с реальными данными)
-    print("\nШаг 2: Вычисление матрицы гомографии (с тестовыми данными)...")
-    
-    # ПРИМЕР: Представим, что мы нашли 4 угла листа А4 на картинке
-    # и измерили их реальные координаты на столе.
-    # ЗАМЕНИТЬ ЭТИ ЗНАЧЕНИЯ НА РЕАЛЬНЫЕ!
-    pixel_points_example = [
-        (100, 100),  # Левый верхний угол на картинке
-        (1180, 100), # Правый верхний
-        (1180, 820), # Правый нижний
-        (100, 820)   # Левый нижний
-    ]
-    # Реальные координаты этих углов на столе (в см)
-    world_points_example = [
-        (0, 0),      # Левый верхний - наша точка (0,0)
-        (29.7, 0),   # Правый верхний (длина А4)
-        (29.7, 21.0),# Правый нижний (длина и ширина А4)
-        (0, 21.0)    # Левый нижний (ширина А4)
-    ]
-
-    mapper.calculate_and_save_homography(pixel_points_example, world_points_example)
-
-    # 3. Использование
-    if mapper.is_ready:
-        print("\nШаг 3: Тестирование преобразования...")
-        test_pixel = (640, 460) # Примерно центр листа
-        world_coords = mapper.pixel_to_world(test_pixel[0], test_pixel[1])
+            
+        world_x = world_coords_2d_homogeneous[0] / world_coords_2d_homogeneous[2]
+        world_y = world_coords_2d_homogeneous[1] / world_coords_2d_homogeneous[2]
         
-        if world_coords:
-            print(f"Пиксель {test_pixel} -> Мировые координаты (см): ({world_coords[0]:.2f}, {world_coords[1]:.2f})")
-            # Ожидаемый результат для тестовых данных: примерно (14.85, 10.5)
+        world_coords_3d = np.array([world_x, world_y, self.work_plane_z])
+        
+        logger.debug(f"Pixel ({u}, {v}) -> World ({world_coords_3d[0]:.4f}, {world_coords_3d[1]:.4f}, {world_coords_3d[2]:.4f})")
+        return world_coords_3d
+        
+    def undistort_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Устраняет дисторсию на изображении.
+        
+        Args:
+            frame (np.ndarray): Искаженное изображение.
 
-    # Очистка созданных "заглушек"
-    if os.path.exists("camera_params.json") and "dummy" in open("camera_params.json").read():
-        os.remove("camera_params.json")
-    if os.path.exists("homography_matrix.json"):
-        os.remove("homography_matrix.json")
-        print("\nТестовые файлы удалены.") 
+        Returns:
+            np.ndarray: Изображение без дисторсии.
+        """
+        if self.mtx is None or self.dist is None:
+            logger.warning("Невозможно устранить дисторсию: данные калибровки отсутствуют.")
+            return frame
+            
+        h, w = frame.shape[:2]
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(self.mtx, self.dist, (w, h), 1, (w, h))
+        
+        dst = cv2.undistort(frame, self.mtx, self.dist, None, newcameramtx)
+        
+        # Обрезаем изображение, чтобы убрать черные поля
+        x, y, w, h = roi
+        if w > 0 and h > 0:
+            dst = dst[y:y+h, x:x+w]
+        
+        return dst
+
+# Пример использования удален, так как он был устаревшим и нерабочим.
+# Для проверки используйте основной цикл приложения. 

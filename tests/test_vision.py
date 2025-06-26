@@ -1,34 +1,46 @@
 """
-Test script for the Vision module.
+Тестовый скрипт для модуля Vision.
 """
 import cv2
 import logging
 import sys
 import os
 
-# Add the project root to the Python path to allow importing 'vision'
+# Добавляем корневую директорию проекта в Python path для корректного импорта
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# Импортируем необходимые классы из проекта
 from vision import Vision
-
-# Basic logging configuration
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from config import settings
+from utils import setup_logging
 
 def main():
     """
-    Initializes the camera using the Vision module, detects colored objects,
-    and displays the results in real-time.
+    Инициализирует камеру, используя модуль Vision, находит объекты
+    всех заданных в конфиге цветов и отображает результат в реальном времени.
     """
-    # Use camera_id=0 for the default system camera. Change if you have multiple cameras.
-    vision_system = Vision(camera_id=0)
+    # Используем общую функцию настройки логгера
+    setup_logging(name="VisionTest", level=logging.INFO)
+    logger = logging.getLogger("VisionTest")
 
-    if not vision_system.initialize_camera():
-        logging.critical("Could not initialize the vision system. Is the camera connected?")
+    try:
+        vision_system = Vision()
+        logger.info("Модуль Vision успешно инициализирован.")
+    except RuntimeError as e:
+        logger.critical(f"Не удалось инициализировать модуль Vision: {e}")
         return
 
-    logging.info("Camera initialized. Press 'q' in the display window to quit.")
+    logger.info("Камера работает. Нажмите 'q' в окне с видео, чтобы выйти.")
 
-    # Visualization colors for different objects
+    # Получаем цвета для поиска из главного файла конфигурации
+    colors_to_detect = list(settings.vision.COLOR_RANGES_HSV.keys())
+    if not colors_to_detect:
+        logger.error("В файле конфигурации не заданы цвета для поиска. Выход.")
+        return
+
+    logger.info(f"Идет поиск следующих цветов: {', '.join(colors_to_detect)}")
+
+    # Словарь с цветами для отрисовки рамок (BGR формат)
     display_colors = {
         "red": (0, 0, 255),
         "green": (0, 255, 0),
@@ -36,39 +48,39 @@ def main():
     }
 
     while True:
-        # 1. Get a frame from the camera
+        # 1. Получаем кадр с камеры
         frame = vision_system.get_frame()
         if frame is None:
-            logging.warning("Failed to get a frame. Retrying...")
+            logger.warning("Не удалось получить кадр. Повторная попытка...")
             continue
 
-        # 2. Find objects using the vision module
-        detected_objects = vision_system.find_colored_objects(frame)
-
-        # 3. Log detections to the console
-        # Log only if there are any detected objects to avoid spamming the console
-        if any(detected_objects.values()):
-            logging.info(f"Detected: {detected_objects}")
-
-        # 4. Visualize the results
         display_frame = frame.copy()
-        for color, objects in detected_objects.items():
-            draw_color = display_colors.get(color, (255, 255, 255))  # Default to white
-            for (x, y) in objects:
-                cv2.circle(display_frame, (x, y), 10, draw_color, 2)
-                cv2.putText(display_frame, color, (x + 15, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, draw_color, 2)
-        
+
+        # 2. Проходим по всем цветам и ищем для каждого самый большой объект
+        for color_name in colors_to_detect:
+            # Ищем объект, но не просим модуль Vision рисовать (draw_debug=False)
+            coords, _ = vision_system.find_object_by_color(display_frame, color_name)
+            
+            # Если объект найден, рисуем на кадре сами
+            if coords:
+                x, y = coords['x'], coords['y']
+                draw_color = display_colors.get(color_name, (255, 255, 255)) # Белый по-умолчанию
+                cv2.circle(display_frame, (x, y), 15, draw_color, 2)
+                cv2.putText(display_frame, color_name, (x + 20, y + 5), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, draw_color, 2)
+
+        # 3. Отображаем итоговый кадр со всеми найденными объектами
         cv2.imshow("Vision Module Test", display_frame)
 
-        # 5. Check for quit command
+        # 4. Проверяем, не нажата ли клавиша 'q' для выхода
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            logging.info("Quit command received.")
+            logger.info("Получена команда на выход.")
             break
 
-    # Clean up
-    vision_system.release_camera()
+    # 5. Освобождаем ресурсы
+    vision_system.release()
     cv2.destroyAllWindows()
-    logging.info("Test finished successfully.")
+    logger.info("Тест успешно завершен.")
 
 if __name__ == "__main__":
     main() 

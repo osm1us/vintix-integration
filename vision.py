@@ -5,123 +5,138 @@ including camera handling and object detection.
 import cv2
 import numpy as np
 import logging
-from data.color_ranges import COLOR_RANGES
+from config import settings
 
 logger = logging.getLogger(__name__)
 
 
 class Vision:
     """
-    Handles camera input and performs color-based object detection.
+    Отвечает за получение изображений с камеры, их обработку и поиск объектов.
     """
 
-    def __init__(self, camera_id: int = 0, width: int = 640, height: int = 480):
+    def __init__(self):
         """
-        Initializes the Vision system.
+        Инициализирует модуль зрения, используя глобальные настройки.
+        """
+        self.config = settings.vision.Camera
+        self.color_ranges_hsv = settings.vision.COLOR_RANGES_HSV
+        self.min_contour_area = settings.vision.MIN_CONTOUR_AREA
+        self.cap = None
 
-        Args:
-            camera_id (int): The ID of the camera to use.
-            width (int): The desired width of the camera frame.
-            height (int): The desired height of the camera frame.
-        """
-        self.camera_id = camera_id
-        self.width = width
-        self.height = height
-        self.camera = None
+        if not self._initialize_camera():
+            raise RuntimeError("Не удалось инициализировать камеру. Проверьте ID и настройки.")
         
-        # Kernel for morphological operations
-        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        logger.info("Модуль Vision успешно инициализирован.")
 
-    def initialize_camera(self) -> bool:
-        """
-        Opens the camera device and sets its parameters.
-
-        Returns:
-            bool: True if the camera was initialized successfully, False otherwise.
-        """
-        logger.info(f"Initializing camera with ID {self.camera_id}...")
-        self.camera = cv2.VideoCapture(self.camera_id)
-        if not self.camera.isOpened():
-            logger.critical("Failed to open camera.")
+    def _initialize_camera(self) -> bool:
+        """Инициализирует захват видео с камеры."""
+        logger.info(f"Попытка подключения к камере ID: {self.config.ID} "
+                    f"с разрешением {self.config.RESOLUTION_WIDTH}x{self.config.RESOLUTION_HEIGHT}")
+        
+        self.cap = cv2.VideoCapture(self.config.ID)
+        if not self.cap.isOpened():
+            logger.critical(f"Не удалось открыть камеру с ID {self.config.ID}.")
             return False
 
-        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Reduce latency
-
-        actual_width = self.camera.get(cv2.CAP_PROP_FRAME_WIDTH)
-        actual_height = self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        logger.info(f"Camera initialized. Resolution: {actual_width}x{actual_height}")
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.RESOLUTION_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.RESOLUTION_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, self.config.BUFFER_SIZE)
         
-        if actual_width != self.width or actual_height != self.height:
-             logger.warning("Camera does not support the requested resolution. Using default.")
-             
+        # Проверка установки параметров
+        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if w != self.config.RESOLUTION_WIDTH or h != self.config.RESOLUTION_HEIGHT:
+             logger.warning(
+                f"Не удалось установить желаемое разрешение. "
+                f"Запрошено: {self.config.RESOLUTION_WIDTH}x{self.config.RESOLUTION_HEIGHT}, "
+                f"Установлено: {w}x{h}"
+            )
+        else:
+            logger.info(f"Разрешение камеры успешно установлено: {w}x{h}")
+            
         return True
 
     def get_frame(self) -> np.ndarray | None:
-        """
-        Captures a single frame from the camera.
-
-        Returns:
-            np.ndarray | None: The captured frame as a NumPy array, or None on failure.
-        """
-        if not self.camera or not self.camera.isOpened():
-            logger.error("Camera is not initialized.")
+        """Захватывает один кадр с камеры."""
+        if not self.cap.isOpened():
+            logger.error("Попытка получить кадр, но камера не инициализирована.")
             return None
-
-        # Grab and retrieve to get the most recent frame
-        self.camera.grab()
-        ret, frame = self.camera.read()
-
-        if not ret or frame is None:
-            logger.error("Failed to grab frame from the camera.")
+        ret, frame = self.cap.read()
+        if not ret:
+            logger.warning("Не удалось захватить кадр с камеры.")
             return None
-
         return frame
 
-    def find_colored_objects(self, frame: np.ndarray, min_area: int = 500) -> dict[str, list[tuple[int, int]]]:
+    def find_object_by_color(self, frame: np.ndarray, color_name: str, draw_debug: bool = False) -> tuple[dict | None, np.ndarray]:
         """
-        Finds objects of predefined colors in the given frame.
+        Находит центр самого большого объекта заданного цвета на изображении.
 
         Args:
-            frame (np.ndarray): The input frame (in BGR format).
-            min_area (int): The minimum contour area to be considered an object.
+            frame (np.ndarray): Кадр для анализа.
+            color_name (str): Название цвета (ключ в self.color_ranges_hsv).
+            draw_debug (bool): Если True, рисует контуры на возвращаемом кадре.
 
         Returns:
-            A dictionary where keys are color names and values are lists of
-            (x, y) coordinates for the center of each detected object.
-            Example: {'red': [(100, 150)], 'blue': []}
+            tuple[dict | None, np.ndarray]:
+                - Словарь с координатами {'x': int, 'y': int} или None, если объект не найден.
+                - Кадр (оригинальный или с отладочной информацией).
         """
+        if color_name not in self.color_ranges_hsv:
+            logger.warning(f"Цвет '{color_name}' не найден в конфигурации.")
+            return None, frame
+
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        detected_objects = {color: [] for color in COLOR_RANGES}
-
-        for color_name, ranges in COLOR_RANGES.items():
-            mask = cv2.inRange(hsv_frame, ranges["lower"], ranges["upper"])
-            
-            # For red, we might have two ranges. This is a placeholder if we need it.
-            # if color_name == 'red' and 'lower2' in ranges:
-            #     mask2 = cv2.inRange(hsv_frame, ranges["lower2"], ranges["upper2"])
-            #     mask = cv2.bitwise_or(mask, mask2)
-
-            # Clean up the mask
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
-            
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area > min_area:
-                    M = cv2.moments(contour)
-                    if M["m00"] != 0:
-                        cx = int(M["m10"] / M["m00"])
-                        cy = int(M["m01"] / M["m00"])
-                        detected_objects[color_name].append((cx, cy))
         
-        return detected_objects
+        # Объединяем маски, если для цвета задано несколько диапазонов (например, для красного)
+        color_masks = []
+        for (lower, upper) in self.color_ranges_hsv[color_name]:
+            color_masks.append(cv2.inRange(hsv_frame, lower, upper))
+        
+        mask = color_masks[0]
+        for i in range(1, len(color_masks)):
+            mask = cv2.bitwise_or(mask, color_masks[i])
 
-    def release_camera(self):
-        """Releases the camera device."""
-        if self.camera and self.camera.isOpened():
-            self.camera.release()
-            logger.info("Camera released.") 
+        # Улучшение маски
+        mask = cv2.erode(mask, None, iterations=2)
+        mask = cv2.dilate(mask, None, iterations=2)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            return None, frame
+
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        # Проверяем, что площадь контура больше минимального порога
+        if cv2.contourArea(largest_contour) < self.min_contour_area:
+            return None, frame
+
+        M = cv2.moments(largest_contour)
+        coords = None
+        if M["m00"] > 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            coords = {'x': cx, 'y': cy}
+            logger.debug(f"Объект цвета '{color_name}' найден в координатах ({cx}, {cy}).")
+        
+        output_frame = frame
+        if draw_debug:
+            output_frame = frame.copy()
+            cv2.drawContours(output_frame, [largest_contour], -1, (0, 255, 0), 2)
+            if coords:
+                cv2.circle(output_frame, (coords['x'], coords['y']), 7, (0, 0, 255), -1)
+            
+        return coords, output_frame
+
+    @staticmethod
+    def display_frame(frame: np.ndarray, window_name: str = "Vision"):
+        """Отображает кадр в окне."""
+        if frame is not None:
+            cv2.imshow(window_name, frame)
+
+    def release(self):
+        """Освобождает ресурс камеры."""
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+            logger.info("Ресурс камеры освобожден.")

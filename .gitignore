@@ -205,3 +205,29 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# --- Vintix Project Specific Ignores ---
+
+# Calibration files
+camera_params.json
+camera_params.yaml
+homography_matrix.json
+
+# Log files and directories
+*.log
+/logs/
+/debug/
+
+# Runtime data
+/data/training_logs/
+/data/training_logs_demo/
+episode_*.h5
+
+# Downloaded models
+# These are large and should be fetched by scripts, not stored in git
+/models/vintix_checkpoint/
+/models/vosk/
+*.zip
+
+# User-specific calibration images
+/calibration_images/

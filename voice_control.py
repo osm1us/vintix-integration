@@ -1,178 +1,161 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Module for handling voice commands using the Vosk library.
-"""
-import vosk
-import pyaudio
-import threading
 import json
 import logging
+import pyaudio
+import threading
 import queue
-import time
+from vosk import Model, KaldiRecognizer
 
-# Настройка логирования
 logger = logging.getLogger(__name__)
 
+# Enum для команд для большей надежности
+class Command:
+    PICK_UP = "PICK_UP"
+    GO_HOME = "GO_HOME"
+    STOP = "STOP"
+    UNKNOWN = "UNKNOWN"
 
-class VoiceCommandHandler:
+class VoiceControl:
     """
-    Обработчик голосовых команд для управления манипулятором.
-    Распознает команды и кладет их в очередь для дальнейшей обработки.
+    Распознает голосовые команды в фоновом потоке и складывает их в очередь.
     """
-
-    def __init__(self, command_queue: queue.Queue, model_path="models/vosk/vosk-model-small-ru-0.22"):
+    def __init__(self, model_path: str, device_index: int | None = None):
         """
-        Инициализация обработчика голосовых команд.
+        Инициализирует систему голосового управления.
 
         Args:
-            command_queue (queue.Queue): Очередь для отправки распознанных команд.
-            model_path (str): Путь к модели распознавания речи Vosk.
+            model_path (str): Путь к директории с моделью Vosk.
+            device_index (int, optional): Индекс аудиоустройства. None для устройства по умолчанию.
         """
-        self.command_queue = command_queue
-        self.model_path = model_path
-        self.sample_rate = 16000
-        self.is_listening = False
-        self.listening_thread = None
-        self.stop_event = threading.Event()
-
-        self.vosk_model = None
-        self.recognizer = None
-        self.audio = None
-
-        self._initialize_vosk()
-        self._initialize_keywords()
-
-    def _initialize_vosk(self):
-        """Инициализация Vosk и PyAudio."""
-        logger.info("Инициализация голосового управления...")
+        logger.info(f"Загрузка модели Vosk из: {model_path}")
         try:
-            self.vosk_model = vosk.Model(self.model_path)
-            logger.info(f"Голосовая модель Vosk загружена из {self.model_path}")
-            self.recognizer = vosk.KaldiRecognizer(self.vosk_model, self.sample_rate)
-            self.audio = pyaudio.PyAudio()
-            logger.info("Vosk и PyAudio успешно инициализированы")
+            self.model = Model(model_path)
         except Exception as e:
-            logger.error(f"Ошибка при инициализации Vosk: {e}")
+            logger.critical(f"Не удалось загрузить модель Vosk. Убедитесь, что путь '{model_path}' корректен. Ошибка: {e}")
             raise
 
-    def _initialize_keywords(self):
-        """Инициализация словарей с ключевыми словами для распознавания команд."""
-        self.action_keywords = {
-            'захвати': 'grab', 'возьми': 'grab', 'подбери': 'grab', 'подними': 'grab',
-            'схвати': 'grab', 'хватай': 'grab', 'взять': 'grab', 'поднять': 'grab',
-            'забери': 'grab', 'захват': 'grab', 'старт': 'grab', 'начать': 'grab',
-            'запуск': 'grab', 'активируй': 'grab'
-        }
-        self.color_keywords = {
-            'красный': 'red', 'красного': 'red', 'красную': 'red', 'красн': 'red',
-            'красны': 'red', 'красненький': 'red',
-            'жёлтый': 'yellow', 'желтый': 'yellow', 'жёлтого': 'yellow', 'желтого': 'yellow',
-            'жёлтую': 'yellow', 'желтую': 'yellow', 'жёлт': 'yellow', 'желт': 'yellow',
-            'жёлты': 'yellow', 'желты': 'yellow', 'жёлтенький': 'yellow', 'желтенький': 'yellow',
-            'зелёный': 'green', 'зеленый': 'green', 'зелёного': 'green', 'зеленого': 'green',
-            'зелёную': 'green', 'зеленую': 'green', 'зелён': 'green', 'зелёны': 'green',
-            'зелен': 'green', 'зелены': 'green', 'зелёненький': 'green', 'зелененький': 'green'
-        }
-        self.stop_keywords = {
-            'стоп': 'stop', 'остановись': 'stop', 'останови': 'stop', 'отмена': 'stop',
-            'хватит': 'stop', 'прекрати': 'stop', 'достаточно': 'stop', 'закончить': 'stop',
-            'отключи': 'stop', 'выключи': 'stop', 'отбой': 'stop', 'сброс': 'stop',
-            'домой': 'home'
-        }
-        logger.info("Словари ключевых слов для голосового управления инициализированы.")
+        self.p = pyaudio.PyAudio()
+        self.device_index = device_index or self._find_default_input_device()
+        if self.device_index is None:
+            raise RuntimeError("Не найдено ни одного активного аудиовхода.")
 
-    def start_listening(self):
-        """Запуск прослушивания голосовых команд в отдельном потоке."""
-        if self.is_listening:
-            logger.info("Голосовое управление уже активно.")
-            return
-        if not self.recognizer:
-            logger.error("Vosk не инициализирован. Прослушивание невозможно.")
-            return
+        self.recognizer = KaldiRecognizer(self.model, 16000)
+        self.command_queue = queue.Queue()
+        
+        self._is_running = False
+        self._thread = None
+        logger.info(f"Голосовое управление инициализировано на устройстве {self.device_index}.")
 
-        self.stop_event.clear()
-        self.is_listening = True
-        self.listening_thread = threading.Thread(target=self._listen_in_background, daemon=True)
-        self.listening_thread.start()
-        logger.info("Активировано прослушивание голосовых команд.")
-
-    def stop_listening(self):
-        """Остановка прослушивания голосовых команд."""
-        if not self.is_listening:
-            logger.info("Голосовое управление уже неактивно.")
-            return
-
-        self.stop_event.set()
-        self.is_listening = False
-        if self.listening_thread:
-            self.listening_thread.join(timeout=1.0)
-        logger.info("Прослушивание голосовых команд деактивировано.")
-
-    def _listen_in_background(self):
-        """Фоновый процесс прослушивания микрофона и распознавания речи."""
-        logger.info("Запущен фоновый поток прослушивания.")
-        stream = self.audio.open(format=pyaudio.paInt16,
-                                 channels=1,
-                                 rate=self.sample_rate,
-                                 input=True,
-                                 frames_per_buffer=8000)
-        stream.start_stream()
-
-        try:
-            while not self.stop_event.is_set():
-                data = stream.read(4000, exception_on_overflow=False)
-                if self.recognizer.AcceptWaveform(data):
-                    result_json = self.recognizer.Result()
-                    result = json.loads(result_json)
-                    if result.get("text"):
-                        text = result["text"]
-                        logger.info(f"Распознана фраза: '{text}'")
-                        parsed_command = self._parse_command(text.lower())
-                        if parsed_command:
-                            logger.info(f"Сформирована команда: {parsed_command}")
-                            self.command_queue.put(parsed_command)
-        except Exception as e:
-            logger.error(f"Ошибка в потоке прослушивания: {e}")
-        finally:
-            stream.stop_stream()
-            stream.close()
-            logger.info("Фоновый поток прослушивания завершен.")
-
-    def _parse_command(self, command_text: str) -> dict | None:
-        """
-        Анализирует текст и преобразует его в структурированную команду.
-
-        Args:
-            command_text: Распознанный текст.
-
-        Returns:
-            Словарь с командой или None, если команда не распознана.
-        """
-        words = command_text.split()
-        action = None
-        color = None
-
-        for word in words:
-            if word in self.action_keywords:
-                action = self.action_keywords.get(word)
-            elif word in self.color_keywords:
-                color = self.color_keywords.get(word)
-            elif word in self.stop_keywords:
-                stop_action = self.stop_keywords.get(word)
-                if stop_action == 'home':
-                    return {'action': 'home'}
-                else:  # 'stop', 'отмена' и т.д.
-                    return {'action': 'stop'}
-
-        if action == 'grab' and color:
-            return {'action': 'grab', 'target': color}
-
-        logger.warning(f"Не удалось распознать известную команду в фразе: '{command_text}'")
+    def _find_default_input_device(self) -> int | None:
+        """Находит первое доступное аудиоустройство для ввода."""
+        logger.debug("Поиск аудиоустройств...")
+        for i in range(self.p.get_device_count()):
+            dev = self.p.get_device_info_by_index(i)
+            if dev['maxInputChannels'] > 0:
+                logger.info(f"Найдено аудиоустройство ввода: index={i}, name={dev['name']}")
+                return i
+        logger.error("Не найдено ни одного подходящего аудиоустройства.")
         return None
 
-    def __del__(self):
-        """Корректное завершение работы при удалении объекта."""
-        self.stop_listening()
-        if self.audio:
-            self.audio.terminate() 
+    def _listen_loop(self):
+        """
+        Основной цикл, который работает в фоновом потоке, слушает микрофон
+        и кладет распознанные команды в очередь.
+        """
+        stream = self.p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=16000,
+            input=True,
+            frames_per_buffer=4096,
+            input_device_index=self.device_index
+        )
+        stream.start_stream()
+        logger.info("Фоновое прослушивание голоса запущено.")
+        
+        while self._is_running:
+            data = stream.read(4096, exception_on_overflow=False)
+            if self.recognizer.AcceptWaveform(data):
+                result_json = self.recognizer.Result()
+                result_text = json.loads(result_json).get("text", "")
+                
+                if result_text:
+                    logger.info(f"Распознан текст: '{result_text}'")
+                    command = self.parse_command(result_text)
+                    self.command_queue.put(command)
+        
+        stream.stop_stream()
+        stream.close()
+        logger.info("Фоновое прослушивание голоса остановлено.")
+
+    def get_command(self) -> dict | None:
+        """
+        Неблокирующий метод для получения команды из очереди.
+        Возвращает команду или None, если очередь пуста.
+        """
+        try:
+            return self.command_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    @staticmethod
+    def parse_command(text: str) -> dict:
+        """
+        Парсит распознанный текст и возвращает структурированную команду,
+        используя ключевые слова из файла конфигурации.
+        """
+        # Импортируем настройки здесь, чтобы избежать циклического импорта
+        # и сохранить статический метод
+        from config import settings
+        
+        words = set(text.lower().split())
+        
+        # Поиск команд (стоп, домой)
+        for word in words:
+            if word in settings.voice.KEYWORDS['command']:
+                command_type = settings.voice.KEYWORDS['command'][word]
+                if command_type == 'stop':
+                    return {"type": Command.STOP, "data": None}
+                elif command_type == 'home':
+                    return {"type": Command.GO_HOME, "data": None}
+        
+        # Поиск сложной команды "захватить <цвет>"
+        action_found = None
+        color_found = None
+
+        for word in words:
+            if word in settings.voice.KEYWORDS['action']:
+                action_found = settings.voice.KEYWORDS['action'][word]
+            if word in settings.voice.KEYWORDS['target_color']:
+                color_found = settings.voice.KEYWORDS['target_color'][word]
+
+        if action_found == 'grab' and color_found:
+            return {"type": Command.PICK_UP, "data": color_found}
+
+        # Если ничего не подошло
+        return {"type": Command.UNKNOWN, "data": text}
+
+    def start(self):
+        """Запускает фоновый поток прослушивания."""
+        if self._is_running:
+            logger.warning("Попытка запустить уже работающий VoiceControl.")
+            return
+            
+        self._is_running = True
+        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """
+        Останавливает прослушивание и освобождает ресурсы.
+        """
+        logger.info("Остановка голосового управления...")
+        if not self._is_running:
+            return
+            
+        self._is_running = False
+        if self._thread:
+            self._thread.join(timeout=2) # Даем потоку время на завершение
+            
+        if hasattr(self, 'p'):
+            self.p.terminate()
+        logger.info("Ресурсы PyAudio освобождены.")

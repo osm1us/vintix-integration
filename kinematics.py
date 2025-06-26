@@ -1,123 +1,81 @@
+import logging
 import ikpy.chain
 import numpy as np
+from config import settings
+
+logger = logging.getLogger(__name__)
+
 
 class Kinematics:
     """
     Класс для работы с кинематикой манипулятора на основе URDF файла.
     Предоставляет методы для прямой и обратной кинематики.
     """
-    def __init__(self, urdf_file_path='manipulator.urdf'):
+    def __init__(self, urdf_path: str, active_links_mask: list[bool]):
         """
         Инициализирует кинематическую цепь из URDF файла.
 
         Args:
-            urdf_file_path (str): Путь к URDF файлу робота.
+            urdf_path (str): Путь к URDF файлу робота.
+            active_links_mask (list[bool]): Маска, указывающая, какие звенья активны.
         """
         try:
-            # Создаем маску, которая явно указывает, какие звенья активны.
-            # Длина маски должна точно совпадать с количеством <link> в URDF (7).
-            # [base_link, link_1, link_2, link_3, link_4, link_5, gripper_link]
-            active_links_mask = [False, True, True, True, True, True, True]
-
             self.chain = ikpy.chain.Chain.from_urdf_file(
-                urdf_file_path,
+                urdf_path,
                 active_links_mask=active_links_mask
             )
-            print(f"Кинематическая цепь успешно загружена из {urdf_file_path}")
-            # Используем новое свойство для получения имен активных звеньев
-            active_links_names = [self.chain.links[i].name for i in self.active_link_indices]
-            print(f"Активные звенья: {active_links_names}")
+            logger.info(f"Кинематическая цепь успешно загружена из {urdf_path}")
+
+            self.num_active_joints = sum(1 for active in active_links_mask if active)
+            logger.info(f"Количество активных суставов: {self.num_active_joints}")
+            
+            # Получаем и кешируем индексы активных звеньев для использования в других методах
+            self.active_link_indices = [i for i, active in enumerate(active_links_mask) if active]
+
         except Exception as e:
-            print(f"Ошибка при загрузке URDF файла: {e}")
-            self.chain = None
-            # Инициализируем кеш даже в случае ошибки, чтобы избежать проблем
-            self._active_link_indices_cache = None
+            logger.critical(f"Ошибка при загрузке URDF файла '{urdf_path}': {e}", exc_info=True)
+            raise
 
-    @property
-    def active_link_indices(self):
-        """
-        Возвращает и кэширует индексы активных звеньев (тех, у которых есть сустав).
-        Использует hasattr для безопасной проверки, избегая ошибок с OriginLink.
-        """
-        # Проверяем, есть ли у нас уже кэшированный результат
-        if hasattr(self, '_active_link_indices_cache') and self._active_link_indices_cache is not None:
-            return self._active_link_indices_cache
-
-        if not self.chain:
-            self._active_link_indices_cache = []
-            return self._active_link_indices_cache
-
-        # Финальная, единственно верная логика, основанная на исходном коде ikpy.
-        # Мы берем `self.chain.active_links_mask` (который мы сами же и задаем)
-        # и находим в нем индексы всех активных звеньев (где значение True).
-        # np.where возвращает кортеж, поэтому берем первый элемент.
-        indices = np.where(self.chain.active_links_mask)[0].tolist()
-        self._active_link_indices_cache = indices
-        return indices
-
-    def forward_kinematics(self, angles):
+    def forward_kinematics(self, angles_rad: list[float]) -> np.ndarray | None:
         """
         Решает прямую задачу кинематики.
 
         Args:
-            angles (list of float): Список углов для каждого сустава в радианах.
-                                   Длина списка должна соответствовать количеству активных суставов.
-                                   Первый элемент списка - для первого сустава (base_link), и т.д.
+            angles_rad (list of float): Список углов для каждого активного сустава в радианах.
 
         Returns:
-            np.ndarray: 4x4 матрица преобразования (положение и ориентация) конечного эффектора.
-                        Возвращает None в случае ошибки.
+            np.ndarray: 4x4 матрица преобразования конечного эффектора или None.
         """
-        if not self.chain:
-            print("Ошибка: кинематическая цепь не инициализирована.")
+        if len(angles_rad) != self.num_active_joints:
+            logger.error(f"Неверное количество углов. Ожидалось {self.num_active_joints}, получено {len(angles_rad)}")
             return None
 
-        # ikpy ожидает, что в массиве углов будет значение для каждого звена,
-        # включая пассивные. Мы добавляем 0 для всех звеньев.
-        full_angles = [0] * len(self.chain.links)
-        
-        # Заменяем дублирующийся код на вызов свойства
-        active_link_indices = self.active_link_indices
-
-        if len(angles) != len(active_link_indices):
-            print(f"Ошибка: ожидалось {len(active_link_indices)} углов, но получено {len(angles)}.")
-            return None
-
-        for i, angle in zip(active_link_indices, angles):
+        full_angles = [0.0] * len(self.chain.links)
+        for i, angle in zip(self.active_link_indices, angles_rad):
             full_angles[i] = angle
 
         return self.chain.forward_kinematics(full_angles)
 
-    def inverse_kinematics(self, target_position, initial_position=None):
+    def inverse_kinematics(self, target_position: list[float], initial_position_rad: list[float] | None = None) -> list[float] | None:
         """
         Решает обратную задачу кинематики.
 
         Args:
             target_position (list of float): Целевые координаты [X, Y, Z] в метрах.
-            initial_position (list of float, optional): Начальное положение суставов в радианах.
-                                                     Используется для более быстрого и точного решения.
-                                                     Если None, используется нулевое положение.
+            initial_position_rad (list of float, optional): Начальное положение суставов.
 
         Returns:
-            list of float: Список углов суставов в радианах для достижения цели.
-                           Возвращает None в случае ошибки или если решение не найдено.
+            list of float: Список углов суставов в радианах или None.
         """
-        if not self.chain:
-            print("Ошибка: кинематическая цепь не инициализирована.")
-            return None
+        if initial_position_rad is None:
+            initial_position_rad = [0.0] * self.num_active_joints
 
-        # Используем свойство для получения активных индексов
-        active_link_indices = self.active_link_indices
-        
-        if initial_position is None:
-            # Создаем начальное положение (все суставы в 0)
-            # Упрощаем код, используя длину списка индексов
-            num_active_joints = len(active_link_indices)
-            initial_position = [0.0] * num_active_joints
-        
-        # ikpy ожидает, что в initial_position будет значение для каждого звена
-        full_initial_position = [0] * len(self.chain.links)
-        for i, angle in zip(active_link_indices, initial_position):
+        if len(initial_position_rad) != self.num_active_joints:
+             logger.error(f"Неверное количество начальных углов. Ожидалось {self.num_active_joints}, получено {len(initial_position_rad)}")
+             return None
+
+        full_initial_position = [0.0] * len(self.chain.links)
+        for i, angle in zip(self.active_link_indices, initial_position_rad):
             full_initial_position[i] = angle
 
         ik_solution = self.chain.inverse_kinematics(
@@ -125,15 +83,32 @@ class Kinematics:
             initial_position=full_initial_position
         )
 
-        # Возвращаем только углы для активных суставов
-        active_ik_solution = [ik_solution[i] for i in active_link_indices]
+        active_ik_solution = [ik_solution[i] for i in self.active_link_indices]
         return active_ik_solution
+
+    def radians_to_steps(self, angles_rad: list[float]) -> list[int] | None:
+        """
+        Преобразует углы в радианах в шаги для шаговых двигателей.
+        
+        Args:
+            angles_rad (list[float]): Список углов в радианах.
+
+        Returns:
+            list[int]: Список соответствующих позиций в шагах или None.
+        """
+        if len(angles_rad) != len(settings.robot.STEPS_PER_RADIAN):
+            logger.error(f"Несоответствие между количеством углов ({len(angles_rad)}) и "
+                         f"количеством настроенных коэффициентов шагов ({len(settings.robot.STEPS_PER_RADIAN)}).")
+            return None
+        
+        steps = [int(angle * ratio) for angle, ratio in zip(angles_rad, settings.robot.STEPS_PER_RADIAN)]
+        return steps
 
 
 # Пример использования
 if __name__ == '__main__':
     # Создаем экземпляр класса
-    kinematics_solver = Kinematics()
+    kinematics_solver = Kinematics(urdf_path='manipulator.urdf', active_links_mask=[False, True, True, True, True, True, True])
 
     if kinematics_solver.chain:
         # --- Пример прямой кинематики ---
@@ -157,7 +132,7 @@ if __name__ == '__main__':
         # Начальное положение для поиска решения (необязательно, но рекомендуется)
         initial_angles = [0, 0, 0, 0, 0, 0]
 
-        ik_angles = kinematics_solver.inverse_kinematics(target_xyz, initial_position=initial_angles)
+        ik_angles = kinematics_solver.inverse_kinematics(target_xyz, initial_position_rad=initial_angles)
 
         if ik_angles is not None:
             print(f"Найденные углы суставов (радианы): {np.round(np.rad2deg(ik_angles), 2)} (в градусах)")
