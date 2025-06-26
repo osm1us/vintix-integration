@@ -5,6 +5,7 @@
 
 import logging
 import numpy as np
+import time
 from config import settings
 from kinematics import Kinematics
 from motor_control import MotorController
@@ -41,40 +42,74 @@ class RobotController:
             logger.info("MotorController инициализирован, соединение проверено.")
 
         self.num_joints = self.kinematics.num_active_joints
-        self.current_angles_rad = [0.0] * self.num_joints
+        self.current_angles_rad = np.array([0.0] * self.num_joints)
+        self.target_angles_rad = np.array([0.0] * self.num_joints)
         
+        # --- Таймаут движения ---
+        self._movement_start_time = None
+        # TODO: Перенести в config.py
+        self._movement_timeout_sec = settings.robot.get("MOVEMENT_TIMEOUT_SEC", 30.0)
+
         # Перемещаем робота в домашнюю позицию при старте
         self.go_home()
 
-    def get_current_angles_rad(self) -> list[float]:
+    def update_state(self):
         """
-        Возвращает последние заданные углы суставов.
-        ВНИМАНИЕ: Это последнее заданное состояние, а не данные с энкодеров.
+        Проверяет, завершилось ли движение, и обновляет внутреннее состояние робота.
+        Этот метод должен вызываться в основном цикле программы для поддержания
+        актуального состояния контроллера.
+        """
+        if not self.is_moving() and not np.array_equal(self.current_angles_rad, self.target_angles_rad):
+            logger.info(f"Движение завершено. Внутреннее состояние обновлено с {self.current_angles_rad} на {self.target_angles_rad}")
+            self.current_angles_rad = np.copy(self.target_angles_rad)
+            self._movement_start_time = None # Сбрасываем таймер после завершения движения
+
+    def get_current_angles_rad(self) -> np.ndarray:
+        """
+        Возвращает текущие углы суставов из внутреннего состояния.
+        ВАЖНО: Этот метод не опрашивает робота, а возвращает последнее
+        известное состояние. Для обновления используйте `update_state()`.
         """
         return self.current_angles_rad
 
-    def set_current_angles_rad(self, joint_angles_rad: list[float]):
-        """
-        Принудительно устанавливает внутреннее состояние углов робота.
-        Вызывать только после подтверждения завершения движения!
-        """
-        if len(joint_angles_rad) != self.num_joints:
-            logger.error(f"Попытка установить неверное количество углов. "
-                         f"Ожидалось {self.num_joints}, получено {len(joint_angles_rad)}.")
-            return
-        self.current_angles_rad = joint_angles_rad
-
     def is_moving(self) -> bool:
         """
-        Проверяет, движется ли робот в данный момент.
+        Проверяет, движется ли робот в данный момент, с учетом таймаута.
         """
-        return self.motor_controller.is_moving()
+        is_hw_moving = self.motor_controller.is_moving()
+
+        if not is_hw_moving:
+            # Если низкоуровневый контроллер говорит, что движения нет, значит, его нет.
+            if self._movement_start_time is not None:
+                # Если мы ожидали движения, но его нет - сбрасываем таймер.
+                self._movement_start_time = None
+            return False
+
+        # Если мы здесь, значит is_hw_moving == True.
+        # Теперь нужно проверить таймаут.
+        if self._movement_start_time is None:
+            # Это странная ситуация: железо движется, но мы не давали команду.
+            # Возможно, это остаточное движение от предыдущей команды.
+            # На всякий случай запускаем таймер, чтобы избежать вечного зависания.
+            logger.warning("Обнаружено движение без отслеживаемой команды. Запускаю таймер безопасности.")
+            self._movement_start_time = time.time()
+        
+        elapsed_time = time.time() - self._movement_start_time
+        if elapsed_time > self._movement_timeout_sec:
+            logger.critical(f"ТАЙМАУТ ДВИЖЕНИЯ! Робот не завершил движение за {self._movement_timeout_sec} сек.")
+            logger.critical("Принудительно останавливаю отслеживание движения. Проверьте робота!")
+            self._movement_start_time = None
+            # Мы не можем остановить физическое движение отсюда, но можем разблокировать ПО.
+            return False # Сообщаем системе, что движение "завершено" (провалено)
+        
+        return True # Движение продолжается, и таймаут не истек.
 
     def get_end_effector_position(self) -> np.ndarray | None:
         """
-        Возвращает текущее положение конечного эффектора (XYZ) на основе последних заданных углов.
+        Возвращает текущее положение конечного эффектора (XYZ) на основе текущих углов.
         """
-        fk_matrix = self.kinematics.forward_kinematics(self.current_angles_rad)
+        current_angles = self.get_current_angles_rad() # Этот геттер теперь "чистый"
+        fk_matrix = self.kinematics.forward_kinematics(current_angles)
         if fk_matrix is not None:
             # Позиция (трансляция) находится в последнем столбце матрицы
             return fk_matrix[:3, 3]
@@ -84,7 +119,8 @@ class RobotController:
 
     def move_to_angles_rad(self, joint_angles_rad: list[float]) -> bool:
         """
-        Перемещает суставы робота в указанные углы (в радианах).
+        Начинает перемещение суставов робота в указанные углы (в радианах).
+        Состояние обновляется автоматически после завершения движения.
 
         Args:
             joint_angles_rad (list[float]): Список целевых углов для активных суставов.
@@ -96,19 +132,27 @@ class RobotController:
             logger.error(f"Неверное количество углов. Ожидалось {self.num_joints}, получено {len(joint_angles_rad)}.")
             return False
 
+        # Нельзя начать новое движение, пока текущее не завершено
+        if self.is_moving():
+            logger.warning("Попытка начать новое движение, пока предыдущее не завершено. Команда проигнорирована.")
+            return False
+
+        # Устанавливаем целевое состояние. Фактическое состояние обновится позже.
+        self.target_angles_rad = np.array(joint_angles_rad)
+        logger.info(f"Новая цель для движения установлена: {self.target_angles_rad}")
+
         try:
             steps = self.kinematics.radians_to_steps(joint_angles_rad)
             if steps is None:
                 logger.error("Не удалось преобразовать радианы в шаги.")
                 return False
 
-            logger.info(f"Преобразованы радианы {joint_angles_rad} в шаги {steps}.")
+            logger.debug(f"Преобразованы радианы {joint_angles_rad} в шаги {steps}.")
 
             success = self.motor_controller.move_joints_by_steps(steps)
             if success:
                 logger.info("Команда на движение успешно отправлена.")
-                # ВНИМАНИЕ: Состояние self.current_angles_rad здесь больше не обновляется.
-                # Это должен делать вызывающий код после подтверждения завершения движения.
+                self._movement_start_time = time.time() # Засекаем время начала движения
             else:
                 logger.error("Не удалось отправить команду на движение.")
             return success
@@ -146,6 +190,10 @@ class RobotController:
         """
         Перемещает робота в домашнюю позицию, определенную в настройках.
         """
+        if self.is_moving():
+            logger.warning("Команда 'домой' проигнорирована, так как робот уже движется.")
+            return False
+            
         logger.info("Отправка робота в домашнюю позицию.")
         home_angles_rad = settings.robot.HOME_ANGLES_RAD
         if len(home_angles_rad) != self.num_joints:
@@ -166,6 +214,8 @@ class RobotController:
             list[float] | None: Список углов суставов в радианах или None.
         """
         logger.info(f"Расчет обратной кинематики для цели: {target_position}")
+        # Нет необходимости вызывать update_state(), так как для расчета IK
+        # достаточно последнего известного (стабильного) положения.
         initial_angles = self.get_current_angles_rad()
         
         return self.kinematics.inverse_kinematics(

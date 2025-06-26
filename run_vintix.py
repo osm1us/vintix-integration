@@ -26,7 +26,13 @@ class RobotState(Enum):
     IDLE = auto()               # Ожидание команд
     PICK_PLACE_PLANNING = auto() # Поиск цели и планирование следующего шага
     PICK_PLACE_MOVING = auto()   # Ожидание завершения движения робота
-    PICK_PLACE_GRASPING = auto() # Выполнение последовательности захвата
+    
+    # --- Новые состояния для неблокирующей последовательности захвата ---
+    GRASP_START = auto()         # Начало последовательности захвата
+    GRASP_CLOSING = auto()       # Ожидание закрытия захвата
+    GRASP_RAISING = auto()       # Ожидание подъема объекта
+    GRASP_GOING_HOME = auto()    # Ожидание возвращения домой
+    GRASP_OPENING = auto()       # Ожидание открытия захвата (финал)
 
 
 class VintixRunner:
@@ -79,6 +85,9 @@ class VintixRunner:
         
         try:
             while self.running and not self.shutdown_manager.is_shutting_down():
+                # --- Шаг 0: Обновление состояний ---
+                self.robot_controller.update_state() # Важно: обновляем состояние робота в начале каждого цикла
+
                 # --- Шаг 1: Получение данных извне ---
                 frame = self.vision.get_frame()
                 if frame is None:
@@ -97,8 +106,12 @@ class VintixRunner:
                     frame = self._handle_pick_place_planning(frame)
                 elif self.state == RobotState.PICK_PLACE_MOVING:
                     frame = self._handle_pick_place_moving(frame)
-                elif self.state == RobotState.PICK_PLACE_GRASPING:
-                    self._handle_pick_place_grasping()
+                elif self.state in [
+                    RobotState.GRASP_START, RobotState.GRASP_CLOSING, 
+                    RobotState.GRASP_RAISING, RobotState.GRASP_GOING_HOME,
+                    RobotState.GRASP_OPENING
+                ]:
+                    self._handle_grasp_sequence()
 
                 # --- Шаг 4: Отображение и задержка ---
                 self.vision.display_frame(frame, "Vintix Control")
@@ -144,6 +157,7 @@ class VintixRunner:
             "target_color": target_color,
             "step": 0,
             "last_reward": 0.0,
+            "last_action_delta": np.zeros(3),
             "target_world_coords": None,
             "next_joint_angles": None
         }
@@ -174,6 +188,7 @@ class VintixRunner:
         
         # Получение действия от агента
         action_delta = self.agent.get_next_action(observation, task["last_reward"])
+        task["last_action_delta"] = action_delta  # Сохраняем действие для логирования
         
         # Применяем дельту к текущим углам
         new_target_angles = np.array(current_angles_rad)
@@ -200,21 +215,21 @@ class VintixRunner:
             return frame
 
         # Движение завершено, можно оценивать результат
+        # Явно обновляем состояние контроллера, чтобы получить актуальные углы
+        self.robot_controller.update_state()
+        
         task = self.pick_place_task
         step = task["step"]
         logger.debug(f"Шаг {step}: движение завершено, оценка результата.")
 
-        # 1. Обновляем внутреннее состояние контроллера робота
-        self.robot_controller.set_current_angles_rad(task["next_joint_angles"])
-        
-        # 2. Получаем новую позицию эффектора
+        # 1. Получаем новую позицию эффектора
         end_effector_pos = self.robot_controller.get_end_effector_position()
         if end_effector_pos is None:
             logger.error("Не удалось получить позицию эффектора, прерывание задачи.")
             self.state = RobotState.IDLE
             return frame
 
-        # 3. Вычисляем вознаграждение и проверяем условие успеха
+        # 2. Вычисляем вознаграждение и проверяем условие успеха
         is_success = False
         target_world_coords = task.get("target_world_coords")
 
@@ -228,19 +243,22 @@ class VintixRunner:
         else:
             task["last_reward"] = -0.1
 
-        # 4. Логируем шаг
+        # 3. Логируем шаг
         observation = np.array(task["next_joint_angles"])
-        # Важно: логируем action, который привел к этому состоянию
-        action_delta = observation[:3] - np.array(self.robot_controller.get_current_angles_rad())[:3]
         
-        self.datalogger.log_step(observation, action_delta, task["last_reward"], step)
+        self.datalogger.log_step(
+            observation, 
+            task["last_action_delta"],  # Используем сохраненное действие
+            task["last_reward"], 
+            step
+        )
         
-        # 5. Обработка завершения эпизода
+        # 4. Обработка завершения эпизода
         task["step"] += 1
         if is_success:
             logger.info(f"УСПЕХ! Эпизод завершен на шаге {task['step']}.")
             self.datalogger.finish_episode(final_reward=1.0)
-            self.state = RobotState.PICK_PLACE_GRASPING
+            self.state = RobotState.GRASP_START # Запускаем неблокирующую последовательность
         elif task["step"] >= settings.agent.episode.MAX_STEPS:
             logger.warning(f"ПРОВАЛ. Эпизод не завершился за {settings.agent.episode.MAX_STEPS} шагов.")
             self.datalogger.finish_episode(final_reward=-1.0)
@@ -251,33 +269,56 @@ class VintixRunner:
         
         return frame
     
-    def _handle_pick_place_grasping(self):
-        """Выполняет физическую последовательность захвата и возвращения домой."""
-        self._perform_grasp_sequence()
-        self.state = RobotState.IDLE # Возвращаемся в режим ожидания
+    def _handle_grasp_sequence(self):
+        """
+        Обрабатывает шаги неблокирующей последовательности захвата,
+        проверяя состояние и переключая его по завершении каждого шага.
+        """
+        if self.robot_controller.is_moving():
+            # Если робот все еще движется, мы просто ждем следующей итерации цикла.
+            return
 
-    def _perform_grasp_sequence(self):
-        """Выполняет физическую последовательность захвата и возвращения домой."""
-        logger.info("Выполнение последовательности захвата...")
-        gripper_delay = settings.robot.gripper.ACTION_DELAY_SEC
+        # Если робот не движется, значит, предыдущая команда завершена, и можно выполнять следующую.
         
-        self.robot_controller.close_gripper()
-        time.sleep(gripper_delay)
+        if self.state == RobotState.GRASP_START:
+            logger.info("Начало последовательности захвата: закрытие захвата.")
+            self.robot_controller.close_gripper()
+            # Даем небольшую задержку для сервопривода, так как он не отслеживается is_moving()
+            # Это единственная допустимая короткая задержка.
+            time.sleep(settings.robot.gripper.ACTION_DELAY_SEC)
+            self.state = RobotState.GRASP_CLOSING
+            # Сразу переходим к следующему состоянию, не дожидаясь здесь.
+            
+        elif self.state == RobotState.GRASP_CLOSING:
+            logger.info("Шаг захвата: подъем объекта.")
+            current_pos = self.robot_controller.get_end_effector_position()
+            if current_pos is not None:
+                target_pos = current_pos + np.array([0, 0, 0.05]) # Поднять на 5 см
+                ik_solution = self.robot_controller.calculate_ik(target_pos.tolist())
+                if ik_solution:
+                    self.robot_controller.move_to_angles_rad(ik_solution)
+                    self.state = RobotState.GRASP_RAISING
+                else:
+                    logger.error("Не удалось рассчитать IK для подъема, перехожу к движению домой.")
+                    self.state = RobotState.GRASP_GOING_HOME
+            else:
+                logger.error("Не удалось получить позицию для подъема, перехожу к движению домой.")
+                self.state = RobotState.GRASP_GOING_HOME
         
-        # Немного приподнять объект перед движением домой
-        current_pos = self.robot_controller.get_end_effector_position()
-        if current_pos is not None:
-            target_pos = current_pos + np.array([0, 0, 0.05]) # Поднять на 5 см
-            ik_solution = self.robot_controller.calculate_ik(target_pos.tolist())
-            if ik_solution:
-                self.robot_controller.move_to_angles_rad(ik_solution)
-                time.sleep(gripper_delay)
+        elif self.state == RobotState.GRASP_RAISING:
+            logger.info("Шаг захвата: возвращение домой.")
+            self.robot_controller.go_home()
+            self.state = RobotState.GRASP_GOING_HOME
 
-        self.robot_controller.go_home()
-        time.sleep(gripper_delay)
-        
-        self.robot_controller.open_gripper()
-        logger.info("Последовательность захвата завершена.")
+        elif self.state == RobotState.GRASP_GOING_HOME:
+            logger.info("Шаг захвата: открытие захвата.")
+            self.robot_controller.open_gripper()
+            time.sleep(settings.robot.gripper.ACTION_DELAY_SEC) # Задержка для серво
+            self.state = RobotState.GRASP_OPENING
+            
+        elif self.state == RobotState.GRASP_OPENING:
+            logger.info("Последовательность захвата успешно завершена.")
+            self.state = RobotState.IDLE # Финальное состояние - ожидание
 
 
     def shutdown(self):

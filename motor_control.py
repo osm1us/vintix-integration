@@ -5,6 +5,7 @@ to the Arduino Nano controlling the stepper motors and servo.
 """
 import requests
 import logging
+import time
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ class MotorController:
         self.status_endpoint = f"http://{self.ip_address}:{self.port}/api/status"
 
         self.session = requests.Session()
+        self._is_expecting_movement = False # Флаг, показывающий, что мы отправили команду и ожидаем движения
         logger.info(f"MotorController инициализирован для работы с {self.api_endpoint}")
 
     def _send_request(self, payload: dict) -> bool:
@@ -80,8 +82,11 @@ class MotorController:
 
         Returns:
             bool: True, если хотя бы один мотор движется; False в противном случае.
-                  В случае ошибки связи возвращает True для безопасности.
+                  В случае ошибки связи возвращает False.
         """
+        if not self._is_expecting_movement:
+            return False # Если мы не отправляли команду на движение, то и проверять нечего
+
         try:
             # Используем более короткий таймаут для частых опросов статуса
             response = self.session.get(self.status_endpoint, timeout=self.timeout * 0.5)
@@ -90,23 +95,30 @@ class MotorController:
             
             motors_status = status_data.get("motors", [])
             if not isinstance(motors_status, list):
-                logger.warning(f"Получен некорректный формат статуса моторов: {motors_status}")
-                return True # Безопаснее считать, что робот движется
+                logger.warning(f"Получен некорректный формат статуса моторов: {motors_status}, считаем движение завершенным.")
+                self._is_expecting_movement = False
+                return False
 
-            for motor in motors_status:
-                if isinstance(motor, dict) and motor.get("moving", False):
-                    return True # Если хотя бы один мотор движется, возвращаем True
+            is_any_motor_moving = any(
+                isinstance(motor, dict) and motor.get("moving", False)
+                for motor in motors_status
+            )
+
+            if not is_any_motor_moving:
+                self._is_expecting_movement = False # Сбрасываем флаг, движение завершено
             
-            return False # Ни один мотор не движется
+            return is_any_motor_moving
 
         except requests.exceptions.RequestException as e:
             logger.warning(f"Не удалось получить статус с контроллера: {e}. "
-                           "Предполагаем, что движение продолжается (fail-safe).")
-            return True # Безопаснее считать, что робот движется, если нет связи
+                           "Считаем, что движение прекращено из-за потери связи.")
+            self._is_expecting_movement = False
+            return False
         except (ValueError, KeyError) as e:
             logger.warning(f"Не удалось разобрать JSON ответа статуса: {e}. "
-                           "Предполагаем, что движение продолжается (fail-safe).")
-            return True # То же самое, если JSON некорректен
+                           "Считаем, что движение завершено.")
+            self._is_expecting_movement = False
+            return False
 
     def move_joints_by_steps(self, steps: list[int]) -> bool:
         """
@@ -124,7 +136,10 @@ class MotorController:
         payload = {"command": command, "params": params}
         
         logger.info(f"Отправка команды '{command}' с параметрами: {params}")
-        return self._send_request(payload)
+        success = self._send_request(payload)
+        if success:
+            self._is_expecting_movement = True # Взводим флаг ожидания движения
+        return success
 
     def set_gripper_angle(self, angle: int) -> bool:
         """

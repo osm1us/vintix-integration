@@ -35,121 +35,143 @@ logger = logging.getLogger(__name__)
 
 class CoordinateMapper:
     """
-    Преобразует 2D координаты с изображения камеры в 3D мировые координаты робота.
+    Преобразует 2D координаты с изображения камеры в 3D мировые координаты робота,
+    используя стабильную робото-центричную систему.
     """
 
-    def __init__(self, work_plane_z: float = 0.0):
+    def __init__(self,
+                 intrinsic_params_path: str = "camera_params.yaml",
+                 extrinsic_params_path: str = "hand_eye_params.yaml"):
         """
-        Инициализирует маппер с использованием файла калибровки из глобальных настроек.
+        Инициализирует маппер, загружая параметры внутренней и внешней калибровки.
 
         Args:
-            work_plane_z (float): Высота рабочей плоскости по оси Z в мировых координатах.
+            intrinsic_params_path (str): Путь к файлу с внутренними параметрами камеры.
+            extrinsic_params_path (str): Путь к файлу с параметрами калибровки "Рука-Глаз".
         """
-        self.work_plane_z = work_plane_z
-        self.mtx = None
-        self.dist = None
-        self.rvecs = None
-        self.tvecs = None
-        self.inv_homography_matrix = None
+        self.camera_matrix = None
+        self.dist_coeffs = None
+        self.transform_robot_to_camera = None
+        self.transform_camera_to_robot = None
+
+        if not self._load_intrinsic_params(intrinsic_params_path):
+            raise ValueError(f"Критическая ошибка: не удалось загрузить файл внутренней калибровки: {intrinsic_params_path}")
         
-        calibration_file = settings.system.CAMERA_PARAMS_PATH
+        if not self._load_extrinsic_params(extrinsic_params_path):
+            raise ValueError(f"Критическая ошибка: не удалось загрузить файл внешней калибровки: {extrinsic_params_path}")
 
-        if not self._load_calibration(calibration_file):
-            raise ValueError(f"Не удалось загрузить или обработать файл калибровки: {calibration_file}")
-
-    def _load_calibration(self, file_path: str) -> bool:
-        """Загружает данные калибровки из YAML файла."""
+    def _load_intrinsic_params(self, file_path: str) -> bool:
+        """Загружает внутренние параметры камеры (матрица, дисторсия)."""
         try:
             with open(file_path, 'r') as f:
-                calib_data = yaml.safe_load(f)
-            
-            self.mtx = np.array(calib_data["camera_matrix"])
-            self.dist = np.array(calib_data["dist_coeff"])
-            self.rvecs = np.array(calib_data["rvecs"])
-            self.tvecs = np.array(calib_data["tvecs"])
-
-            logger.info(f"Данные калибровки успешно загружены из {file_path}")
-            
-            # Рассчитываем матрицу гомографии при загрузке
-            self._compute_homography()
+                params = yaml.safe_load(f)
+            self.camera_matrix = np.array(params["camera_matrix"])
+            self.dist_coeffs = np.array(params["dist_coeff"])
+            logger.info(f"Внутренние параметры камеры успешно загружены из '{file_path}'.")
             return True
-
         except FileNotFoundError:
-            logger.error(f"Файл калибровки не найден: {file_path}")
+            logger.error(f"Файл внутренней калибровки не найден: {file_path}")
             return False
         except (KeyError, TypeError) as e:
-            logger.error(f"Ошибка в структуре файла калибровки {file_path}: {e}")
+            logger.error(f"Ошибка в структуре файла внутренней калибровки {file_path}: {e}")
             return False
 
-    def _compute_homography(self):
-        """
-        Рассчитывает матрицу гомографии для преобразования координат.
-        Этот метод был значительно упрощен, так как camera_calibration.py
-        теперь сохраняет rvecs и tvecs.
-        """
-        if self.rvecs is None or self.tvecs is None:
-            logger.error("Невозможно рассчитать гомографию: отсутствуют векторы вращения или трансляции.")
-            return
+    def _load_extrinsic_params(self, file_path: str) -> bool:
+        """Загружает внешние параметры (трансформация Робот -> Камера)."""
+        try:
+            with open(file_path, 'r') as f:
+                params = yaml.safe_load(f)
+            
+            self.transform_robot_to_camera = np.array(params["transform_robot_to_camera"])
+            
+            # Предварительно вычисляем обратную матрицу, так как она используется чаще
+            R = self.transform_robot_to_camera[:3, :3]
+            t = self.transform_robot_to_camera[:3, 3]
+            R_inv = R.T
+            t_inv = -R_inv @ t
+            
+            self.transform_camera_to_robot = np.eye(4)
+            self.transform_camera_to_robot[:3, :3] = R_inv
+            self.transform_camera_to_robot[:3, 3] = t_inv
 
-        # Используем первый вектор вращения и трансляции
-        rvec = self.rvecs[0]
-        tvec = self.tvecs[0]
-        
-        # Преобразуем вектор вращения в матрицу вращения
-        R, _ = cv2.Rodrigues(rvec)
-        
-        # Собираем матрицу гомографии.
-        # Исключаем Z-компоненту из матрицы вращения, так как мы проецируем на плоскость.
-        H = np.hstack((R[:, 0:2], tvec))
-        H_inv = np.linalg.inv(self.mtx @ H)
-        
-        self.inv_homography_matrix = H_inv
-        logger.info("Матрица гомографии успешно рассчитана и инвертирована.")
+            logger.info(f"Внешние параметры калибровки ('Рука-Глаз') успешно загружены из '{file_path}'.")
+            return True
+        except FileNotFoundError:
+            logger.error(f"Файл внешней калибровки не найден: {file_path}")
+            return False
+        except (KeyError, TypeError) as e:
+            logger.error(f"Ошибка в структуре файла внешней калибровки {file_path}: {e}")
+            return False
 
-
-    def pixel_to_world(self, u: int, v: int) -> np.ndarray | None:
+    def pixel_to_robot_coords(self, u: int, v: int, z_robot: float = 0.0) -> np.ndarray | None:
         """
-        Преобразует 2D пиксельные координаты (u, v) в 3D мировые координаты (X, Y, Z).
+        Преобразует 2D пиксельные координаты (u, v) в 3D координаты (X, Y, Z) 
+        в системе координат РОБОТА на заданной высоте Z.
 
         Args:
             u (int): Координата X на изображении (пиксель).
             v (int): Координата Y на изображении (пиксель).
+            z_robot (float): Целевая высота Z в системе координат робота (например, высота стола).
 
         Returns:
-            np.ndarray: Массив [X, Y, Z] в мировых координатах или None.
+            np.ndarray: Массив [X, Y, Z] в координатах робота или None, если преобразование невозможно.
         """
-        if self.inv_homography_matrix is None:
-            logger.error("Преобразование невозможно: матрица гомографии не рассчитана.")
+        if self.camera_matrix is None or self.transform_camera_to_robot is None:
+            logger.error("Преобразование невозможно: параметры калибровки не загружены.")
             return None
 
         # Шаг 1: Устраняем дисторсию для входной точки.
-        # Гомография корректно работает только на точках без искажений.
-        pixel_coords_distorted = np.array([[[u, v]]], dtype=np.float32)
-        
-        pixel_coords_undistorted = cv2.undistortPoints(
-            pixel_coords_distorted, self.mtx, self.dist, P=self.mtx
-        )
-        
-        # Извлекаем исправленные координаты
-        u_corr, v_corr = pixel_coords_undistorted[0, 0]
+        pixel_distorted = np.array([[[u, v]]], dtype=np.float32)
+        pixel_undistorted = cv2.undistortPoints(pixel_distorted, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix)
+        u_corr, v_corr = pixel_undistorted[0, 0]
 
-        # Шаг 2: Применяем гомографию к ИСПРАВЛЕННОЙ точке.
-        pixel_coords_homogeneous = np.array([u_corr, v_corr, 1], dtype=np.float32)
-        world_coords_2d_homogeneous = self.inv_homography_matrix @ pixel_coords_homogeneous
+        # Шаг 2: Создаем точку в однородных координатах и нормализуем ее,
+        # чтобы получить вектор направления в системе координат КАМЕРЫ.
+        cam_fx = self.camera_matrix[0, 0]
+        cam_fy = self.camera_matrix[1, 1]
+        cam_cx = self.camera_matrix[0, 2]
+        cam_cy = self.camera_matrix[1, 2]
+
+        # Вектор, исходящий из центра камеры и проходящий через пиксель
+        vector_in_camera_frame = np.array([(u_corr - cam_cx) / cam_fx,
+                                           (v_corr - cam_cy) / cam_fy,
+                                           1.0])
         
-        # Нормализуем, чтобы последняя компонента была 1
-        if world_coords_2d_homogeneous[2] == 0:
-            logger.error("Ошибка при преобразовании координат: деление на ноль.")
+        # Нормализуем вектор (хотя это не строго обязательно для этого метода)
+        vector_in_camera_frame /= np.linalg.norm(vector_in_camera_frame)
+
+        # Шаг 3: Трансформируем начало координат камеры и вектор направления
+        # из системы камеры в систему робота.
+        R_cam_to_robot = self.transform_camera_to_robot[:3, :3]
+        t_cam_to_robot = self.transform_camera_to_robot[:3, 3] # Это позиция камеры в мире робота
+
+        vector_in_robot_frame = R_cam_to_robot @ vector_in_camera_frame
+        camera_pos_in_robot_frame = t_cam_to_robot
+
+        # Шаг 4: Находим точку пересечения луча с горизонтальной плоскостью z = z_robot.
+        # Уравнение луча: P = camera_pos + t * vector
+        # P.z = z_robot => camera_pos.z + t * vector.z = z_robot
+        # t = (z_robot - camera_pos.z) / vector.z
+        
+        vec_z = vector_in_robot_frame[2]
+        if abs(vec_z) < 1e-6:
+            # Луч параллелен плоскости XY, пересечения не будет (или их бесконечно много)
+            logger.warning("Луч параллелен рабочей плоскости. Невозможно найти пересечение.")
             return None
-            
-        world_x = world_coords_2d_homogeneous[0] / world_coords_2d_homogeneous[2]
-        world_y = world_coords_2d_homogeneous[1] / world_coords_2d_homogeneous[2]
+
+        t = (z_robot - camera_pos_in_robot_frame[2]) / vec_z
+
+        if t < 0:
+            # Пересечение находится позади камеры, что физически невозможно.
+            logger.warning(f"Точка пересечения находится позади камеры (t={t:.2f}). Проверьте калибровку.")
+            return None
+
+        # Находим финальные координаты точки в мире робота
+        target_point_robot = camera_pos_in_robot_frame + t * vector_in_robot_frame
         
-        world_coords_3d = np.array([world_x, world_y, self.work_plane_z])
-        
-        logger.debug(f"Pixel ({u}, {v}) -> Corrected ({u_corr:.2f}, {v_corr:.2f}) -> World ({world_coords_3d[0]:.4f}, {world_coords_3d[1]:.4f}, {world_coords_3d[2]:.4f})")
-        return world_coords_3d
-        
+        logger.debug(f"Pixel ({u}, {v}) -> Robot Coords ({target_point_robot[0]:.4f}, {target_point_robot[1]:.4f}, {target_point_robot[2]:.4f})")
+        return target_point_robot
+
     def undistort_frame(self, frame: np.ndarray) -> np.ndarray:
         """
         Устраняет дисторсию на изображении.
@@ -160,14 +182,14 @@ class CoordinateMapper:
         Returns:
             np.ndarray: Изображение без дисторсии.
         """
-        if self.mtx is None or self.dist is None:
+        if self.camera_matrix is None or self.dist_coeffs is None:
             logger.warning("Невозможно устранить дисторсию: данные калибровки отсутствуют.")
             return frame
             
         h, w = frame.shape[:2]
-        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(self.mtx, self.dist, (w, h), 1, (w, h))
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(self.camera_matrix, self.dist_coeffs, (w, h), 1, (w, h))
         
-        dst = cv2.undistort(frame, self.mtx, self.dist, None, newcameramtx)
+        dst = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs, None, newcameramtx)
         
         # Обрезаем изображение, чтобы убрать черные поля
         x, y, w, h = roi
