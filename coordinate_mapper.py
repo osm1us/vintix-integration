@@ -158,7 +158,7 @@ class CoordinateMapper:
             # Луч параллелен плоскости XY, пересечения не будет (или их бесконечно много)
             logger.warning("Луч параллелен рабочей плоскости. Невозможно найти пересечение.")
             return None
-
+            
         t = (z_robot - camera_pos_in_robot_frame[2]) / vec_z
 
         if t < 0:
@@ -171,7 +171,7 @@ class CoordinateMapper:
         
         logger.debug(f"Pixel ({u}, {v}) -> Robot Coords ({target_point_robot[0]:.4f}, {target_point_robot[1]:.4f}, {target_point_robot[2]:.4f})")
         return target_point_robot
-
+        
     def undistort_frame(self, frame: np.ndarray) -> np.ndarray:
         """
         Устраняет дисторсию на изображении.

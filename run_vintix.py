@@ -182,7 +182,7 @@ class VintixRunner:
 
         # Получаем текущее состояние робота
         current_angles_rad = self.robot_controller.get_current_angles_rad()
-        
+
         # Формируем вектор наблюдения (только проприоцепция).
         observation = np.array(current_angles_rad)
         
@@ -282,7 +282,7 @@ class VintixRunner:
         
         if self.state == RobotState.GRASP_START:
             logger.info("Начало последовательности захвата: закрытие захвата.")
-            self.robot_controller.close_gripper()
+        self.robot_controller.close_gripper()
             # Даем небольшую задержку для сервопривода, так как он не отслеживается is_moving()
             # Это единственная допустимая короткая задержка.
             time.sleep(settings.robot.gripper.ACTION_DELAY_SEC)
@@ -291,12 +291,12 @@ class VintixRunner:
             
         elif self.state == RobotState.GRASP_CLOSING:
             logger.info("Шаг захвата: подъем объекта.")
-            current_pos = self.robot_controller.get_end_effector_position()
-            if current_pos is not None:
-                target_pos = current_pos + np.array([0, 0, 0.05]) # Поднять на 5 см
-                ik_solution = self.robot_controller.calculate_ik(target_pos.tolist())
-                if ik_solution:
-                    self.robot_controller.move_to_angles_rad(ik_solution)
+        current_pos = self.robot_controller.get_end_effector_position()
+        if current_pos is not None:
+            target_pos = current_pos + np.array([0, 0, 0.05]) # Поднять на 5 см
+            ik_solution = self.robot_controller.calculate_ik(target_pos.tolist())
+            if ik_solution:
+                self.robot_controller.move_to_angles_rad(ik_solution)
                     self.state = RobotState.GRASP_RAISING
                 else:
                     logger.error("Не удалось рассчитать IK для подъема, перехожу к движению домой.")
@@ -307,12 +307,12 @@ class VintixRunner:
         
         elif self.state == RobotState.GRASP_RAISING:
             logger.info("Шаг захвата: возвращение домой.")
-            self.robot_controller.go_home()
+        self.robot_controller.go_home()
             self.state = RobotState.GRASP_GOING_HOME
 
         elif self.state == RobotState.GRASP_GOING_HOME:
             logger.info("Шаг захвата: открытие захвата.")
-            self.robot_controller.open_gripper()
+        self.robot_controller.open_gripper()
             time.sleep(settings.robot.gripper.ACTION_DELAY_SEC) # Задержка для серво
             self.state = RobotState.GRASP_OPENING
             

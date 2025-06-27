@@ -49,7 +49,7 @@ class RobotController:
         self._movement_start_time = None
         # TODO: Перенести в config.py
         self._movement_timeout_sec = settings.robot.get("MOVEMENT_TIMEOUT_SEC", 30.0)
-
+        
         # Перемещаем робота в домашнюю позицию при старте
         self.go_home()
 
