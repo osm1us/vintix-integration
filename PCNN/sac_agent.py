@@ -42,13 +42,16 @@ class Actor(nn.Module):
 
         self.max_action = max_action
 
-    def forward(self, state):
+    def forward(self, state, deterministic=False):
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
         
         mean = self.mean_layer(x)
         
-        # Ограничиваем log_std, чтобы избежать слишком больших или малых значений
+        # Для теста используется детерминированное действие (среднее)
+        if deterministic:
+            return self.max_action * torch.tanh(mean)
+
         log_std = self.log_std_layer(x)
         log_std = torch.clamp(log_std, min=-20, max=2)
         std = torch.exp(log_std)
@@ -141,10 +144,13 @@ class SAC:
         
         self.max_action = max_action
 
-    def select_action(self, state):
+    def select_action(self, state, deterministic=False):
         """Выбирает действие на основе текущего состояния."""
         state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
-        action, _ = self.actor(state)
+        if deterministic:
+            action = self.actor(state, deterministic=True)
+        else:
+            action, _ = self.actor(state)
         return action.cpu().data.numpy().flatten()
 
     def update(self, n_iterations=1):
@@ -217,13 +223,32 @@ class SAC:
             for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-    def save(self, filename):
-        """Сохраняет веса моделей."""
-        torch.save(self.critic.state_dict(), filename + "_critic.pth")
-        torch.save(self.actor.state_dict(), filename + "_actor.pth")
+    def save(self, filepath):
+        """Сохраняет полный чекпоинт (модели и оптимизаторы) в один файл."""
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+        }, filepath)
 
-    def load(self, filename):
-        """Загружает веса моделей."""
-        self.critic.load_state_dict(torch.load(filename + "_critic.pth"))
-        self.critic_target.load_state_dict(self.critic.state_dict())
-        self.actor.load_state_dict(torch.load(filename + "_actor.pth")) 
+    def load(self, filepath, is_checkpoint=True):
+        """
+        Загружает чекпоинт или старый формат моделей.
+        :param filepath: Путь к файлу чекпоинта или базовый путь к старым файлам.
+        :param is_checkpoint: True, если это новый формат (один файл). False для старого.
+        """
+        if is_checkpoint:
+            print("INFO: Загрузка из файла-чекпоинта (новый формат).")
+            checkpoint = torch.load(filepath, map_location=self.device)
+            self.actor.load_state_dict(checkpoint['actor_state_dict'])
+            self.critic.load_state_dict(checkpoint['critic_state_dict'])
+            self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+            self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        else:
+            print("WARNING: Загрузка из файлов старого формата. Состояния оптимизаторов не будут восстановлены.")
+            self.actor.load_state_dict(torch.load(filepath + "_actor.pth", map_location=self.device))
+            self.critic.load_state_dict(torch.load(filepath + "_critic.pth", map_location=self.device))
+        
+        # Не забываем обновить веса целевой сети после загрузки основной
+        self.critic_target.load_state_dict(self.critic.state_dict()) 
