@@ -6,6 +6,8 @@ import os
 import time
 import csv
 import re # Добавим для поиска эпизодов
+import matplotlib.pyplot as plt
+import pybullet as p
 
 def find_latest_episode(model_dir):
     """Находит путь к последнему сохраненному чекпоинту или модели в папке."""
@@ -42,7 +44,7 @@ def find_latest_episode(model_dir):
     return max_episode, latest_path, False
 
 
-def train(model_save_dir, load_from_path=None, start_episode=0, is_checkpoint=True):
+def train(model_save_dir, load_from_path=None, start_episode=0, is_checkpoint=True, visualize=False):
     """
     Главная функция для запуска процесса обучения.
 
@@ -50,12 +52,14 @@ def train(model_save_dir, load_from_path=None, start_episode=0, is_checkpoint=Tr
     :param load_from_path: (Опционально) Путь к файлам существующей модели для дообучения.
     :param start_episode: (Опционально) Номер эпизода, с которого начинать обучение.
     :param is_checkpoint: (Опционально) True, если модель в формате чекпоинта.
+    :param visualize: (Опционально) True, чтобы включить визуализацию процесса обучения.
     """
     # --- 1. Гиперпараметры обучения ---
-    max_episodes = 5000          # Общее количество эпизодов для обучения
-    max_steps_per_episode = 500  # Максимальная длина одного эпизода
-    start_timesteps = 1500       # Количество шагов со случайными действиями для заполнения буфера
-    save_model_freq = 200        # Как часто (в эпизодах) сохранять модель
+    max_episodes = 10000         # Увеличим кол-во, т.к. задача сложнее
+    max_steps_per_episode = 700  # Увеличим шаги, т.к. нужно время на подъем
+    start_timesteps = 2500       # Больше случайных шагов для более сложной задачи
+    save_model_freq = 500        # Сохраняем реже
+    update_every = 2             # Обновляем нейросеть каждые N шагов для ускорения
     
     os.makedirs(model_save_dir, exist_ok=True)
     
@@ -71,10 +75,10 @@ def train(model_save_dir, load_from_path=None, start_episode=0, is_checkpoint=Tr
     print(f"INFO: Логи {'дозаписываются' if file_mode == 'a' else 'сохраняются'} в: {log_file_path}")
 
     # --- 2. Инициализация среды и агента ---
-    env = ManipulatorEnv(render=False) 
+    env = ManipulatorEnv(render=visualize) 
     
-    state_dim = 14 
-    action_dim = 6
+    state_dim = 16 
+    action_dim = 7
     max_action = np.pi 
 
     agent = SAC(state_dim, action_dim, max_action)
@@ -92,8 +96,20 @@ def train(model_save_dir, load_from_path=None, start_episode=0, is_checkpoint=Tr
     print(f"Модели будут сохраняться в: {model_save_dir}")
     print("-" * 50)
 
+    # --- Настройка визуализации (если включена) ---
+    if visualize:
+        plt.ion()
+        fig, ax = plt.subplots(figsize=(6, 6))
+        img_plot = ax.imshow(np.zeros((320, 320, 4))) 
+        ax.set_title("Training View")
+        plt.show(block=False)
+
     # --- 3. Главный цикл обучения ---
     total_timesteps = 0
+    # При дообучении нужно пересчитать total_timesteps, чтобы правильно работал start_timesteps
+    if start_episode > 0:
+        total_timesteps = start_episode * max_steps_per_episode # Примерная оценка
+
     for episode in range(start_episode, max_episodes):
         state = env.reset()
         episode_reward = 0
@@ -101,7 +117,7 @@ def train(model_save_dir, load_from_path=None, start_episode=0, is_checkpoint=Tr
         for step in range(max_steps_per_episode):
             # В начале собираем опыт, выполняя случайные действия
             if total_timesteps < start_timesteps:
-                action = np.random.uniform(low=-max_action, high=max_action, size=action_dim)
+                action = np.random.uniform(low=-1, high=1, size=action_dim)
             else:
                 action = agent.select_action(state)
 
@@ -114,13 +130,23 @@ def train(model_save_dir, load_from_path=None, start_episode=0, is_checkpoint=Tr
             episode_reward += reward
             total_timesteps += 1
 
-            if total_timesteps > start_timesteps:
+            # Обновляем веса сетей не на каждом шаге, а с заданной периодичностью
+            if total_timesteps > start_timesteps and total_timesteps % update_every == 0:
                 agent.update()
+
+            if visualize:
+                # Обновляем вид с камеры
+                _, _, rgba_img_flat, _, _ = p.getCameraImage(320, 320, env.camera_view_matrix, env.camera_proj_matrix)
+                rgba_img = np.reshape(rgba_img_flat, (320, 320, 4))
+                img_plot.set_data(rgba_img)
+                ax.set_title(f"Episode {episode+1} | Step {step+1}\nTarget: ({state[0]:.2f}, {state[1]:.2f})")
+                fig.canvas.draw()
+                fig.canvas.flush_events()
 
             if done:
                 break
         
-        print(f"Эпизод: {episode+1}, Шагов: {step+1}, Награда: {episode_reward:.2f}, Дистанция: {info.get('distance', -1):.3f}")
+        print(f"Эпизод: {episode+1}, Шагов: {step+1}, Награда: {episode_reward:.2f}, Дистанция: {info.get('distance', -1):.3f}, Захват: {info.get('is_grasping', False)}")
 
         # Запись в лог-файл
         distance = info.get('distance', -1)
@@ -158,7 +184,11 @@ def main():
         # Новое обучение
         run_name = f"sac_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
         model_save_dir = os.path.join(models_base_dir, run_name)
-        train(model_save_dir)
+        
+        vis_choice = input("Включить визуализацию? (сильно замедлит обучение) [y/N]: ").lower()
+        visualize = vis_choice == 'y'
+
+        train(model_save_dir, visualize=visualize)
 
     elif choice == '2':
         # Продолжить обучение
@@ -193,7 +223,10 @@ def main():
             print(f"\nПродолжаем обучение модели '{saved_models[model_choice_idx]}'.")
             print(f"Начинаем с эпизода {start_episode + 1}.")
             
-        train(selected_model_dir, load_from_path=load_path, start_episode=start_episode, is_checkpoint=is_checkpoint)
+        vis_choice = input("Включить визуализацию? (сильно замедлит обучение) [y/N]: ").lower()
+        visualize = vis_choice == 'y'
+
+        train(selected_model_dir, load_from_path=load_path, start_episode=start_episode, is_checkpoint=is_checkpoint, visualize=visualize)
     
     elif choice == '0':
         print("Выход.")

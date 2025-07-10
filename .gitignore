@@ -231,3 +231,11 @@ episode_*.h5
 
 # User-specific calibration images
 /calibration_images/
+
+# User-specific files
+.DS_Store
+*.pem
+*.ipynb_checkpoints
+
+# PCNN Models
+PCNN/models/

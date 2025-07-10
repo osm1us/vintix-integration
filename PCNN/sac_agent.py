@@ -118,7 +118,14 @@ class SAC:
     """
     def __init__(self, state_dim, action_dim, max_action, replay_buffer_capacity=1000000):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # --- Диагностика CUDA ---
+        print("-" * 50)
         print(f"INFO: SAC-агент будет использовать устройство: {self.device}")
+        if torch.cuda.is_available():
+            print(f"INFO: Имя устройства: {torch.cuda.get_device_name(0)}")
+            print(f"INFO: Доступно видеопамяти: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        print("-" * 50)
 
         # --- Гиперпараметры ---
         self.gamma = 0.99  # Дисконтирующий фактор
@@ -251,4 +258,4 @@ class SAC:
             self.critic.load_state_dict(torch.load(filepath + "_critic.pth", map_location=self.device))
         
         # Не забываем обновить веса целевой сети после загрузки основной
-        self.critic_target.load_state_dict(self.critic.state_dict()) 
+        self.critic_target.load_state_dict(self.critic.state_dict())
